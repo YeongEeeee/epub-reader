@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Folio EPUB Reader</title>
+  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=Noto+Serif+KR:wght@400;700&family=Gowun+Batang:wght@400;700&display=swap" rel="stylesheet">
+  
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#fcfbf7">
+  
+  <link rel="stylesheet" href="./style.css">
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/epubjs/0.3.93/epub.min.js"></script>
+</head>
+<body>
+
+  <div id="app">
+    <div id="screen-uploader" class="app-screen">
+      <div class="dropzone" id="dropzone">
+        <div class="dropzone-icon">📚</div>
+        <h2>EPUB 파일을 여기에 드래그 앤 드롭하세요</h2>
+        <p>또는 파일 시스템에서 직접 선택</p>
+        <input type="file" id="epub-file-input" accept=".epub" style="display: none;">
+        <button type="button" class="btn-select" onclick="document.getElementById('epub-file-input').click()">파일 선택</button>
+      </div>
+    </div>
+
+    <div id="screen-viewer" class="app-screen" style="display: none;">
+      <div class="viewer-nav-bar">
+        <div class="nav-left">
+          <button class="nav-action-btn" id="btn-toc-toggle">☰ 목차</button>
+        </div>
+        <div class="nav-title-area" id="book-title-display">도서 제목 정보 로딩 중...</div>
+        <div class="nav-right">
+          <button class="nav-action-btn" id="btn-close-viewer">✕ 닫기</button>
+        </div>
+      </div>
+
+      <button class="floating-arrow-btn prev" id="arrow-prev" aria-label="이전 페이지">◀</button>
+      <button class="floating-arrow-btn next" id="arrow-next" aria-label="다음 페이지">▶</button>
+
+      <div class="reader-main-frame">
+        <div id="viewer-viewport"></div>
+      </div>
+
+      <div class="viewer-bottom-bar">
+        <span id="reading-percentage">0%</span>
+        <span id="reading-location-range">- / -</span>
+      </div>
+      
+      <div id="toc-sidebar" class="toc-sidebar" style="display: none;">
+        <div class="toc-header">
+          <h3>📖 목차 이동</h3>
+          <button id="btn-toc-close">✕</button>
+        </div>
+        <div id="toc-list-container" class="toc-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="global-toast-container" class="toast-container"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
