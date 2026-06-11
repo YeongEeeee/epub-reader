@@ -1,6 +1,6 @@
 {
-  "name": "Folio EPUB Reader",
-  "short_name": "Folio 리더",
+  "name": "Fable",
+  "short_name": "Fable",
   "description": "바닐라 JS 기반의 고성능 Folio 스타일 EPUB 리더",
   "start_url": "./index.html",
   "display": "standalone",

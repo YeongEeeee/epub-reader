@@ -843,7 +843,6 @@ function initTouchSwipe() {
   }, { passive: true });
 }
 
-
 /* ── 16. 앱 초기화 ───────────────────────────────────────── */
 function init() {
   // 뷰어 스크린 초기 상태: 숨김
@@ -855,21 +854,17 @@ function init() {
   if (tocSidebar) tocSidebar.style.display = 'none';
 
   initDropzone();
-  initGlobalDragPrevention();
-  initButtonEvents();
-  initKeyboardEvents();
-  initTouchSwipe();
+  initGlobalEvents();
 
-  // epub.js 로드 확인
-  if (typeof ePub === 'undefined') {
-    Toast.show('epub.js 라이브러리를 불러오지 못했습니다. 네트워크를 확인해 주세요.', 'error');
-    console.error('[Folio] epub.js (ePub) 전역 변수 없음.');
+  // 안전장치 가드: 라이브러리 최종 존재 유무 검증 문턱 낮추기
+  if (typeof ePub === 'undefined' && typeof window.ePub === 'undefined') {
+    console.error("[Folio] epub.js (ePub) 전역 변수 없음.");
+    showToast("리더 엔진 라이브러리를 로드하지 못했습니다. 페이지를 새로고침해 주세요.", true);
+    return;
   }
+  
+  console.log("🚀 Fable Engine Initialized Successfully.");
 }
 
-// DOM 준비 후 실행
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
-}
+// 브라우저가 HTML/라이브러리 파싱을 완전히 마친 후 안전하게 init 실행
+document.addEventListener('DOMContentLoaded', init);
