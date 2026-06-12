@@ -1,12 +1,15 @@
 /* ============================================================
-   FOLIO EPUB READER — style.css
-   Fable v2 Premium · UX 고도화 20선 통합
+   Fable v3 Premium — style.css
+   Proxy 기반 리액티브 아키텍처 대응 스타일시트
+   UX 고도화 20선 + 초고급 상용 스펙 3선
+   커스텀 CSS 변수 변환 맵 포함
    ============================================================ */
 
 /* ── 0. CSS 변수 & 리셋 ──────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  /* 기본 팔레트 */
   --color-paper:         #fcfbf7;
   --color-paper-alt:     #f5f3ec;
   --color-ink:           #1a1814;
@@ -18,20 +21,35 @@
   --color-border-soft:   #ede9e0;
   --color-shadow:        rgba(26, 24, 20, 0.08);
   --color-overlay:       rgba(26, 24, 20, 0.45);
+
+  /* 토스트 */
   --color-toast-bg:      #2a2520;
   --color-toast-text:    #f0ece4;
   --color-toast-error:   #c0392b;
   --color-toast-success: #5d8a5e;
+
+  /* 폰트 */
   --font-ui:     'Noto Sans KR', system-ui, -apple-system, sans-serif;
   --font-reader: 'Gowun Batang', 'Noto Serif KR', Georgia, serif;
-  --nav-height:    52px;
-  --bottom-height: 36px;
-  --sidebar-width: 300px;
+
+  /* 레이아웃 */
+  --nav-height:     52px;
+  --bottom-height:  36px;
+  --sidebar-width:  300px;
   --settings-width: 280px;
-  --ease-out:  cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-in:   cubic-bezier(0.55, 0, 1, 0.45);
+
+  /* 이징 */
+  --ease-out:    cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in:     cubic-bezier(0.55, 0, 1, 0.45);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --duration:  220ms;
+  --duration:    220ms;
+
+  /* ── [UX#23] 커스텀 테마 CSS 변수 변환 맵 ── */
+  /* app.js의 store.userBg / userInk / userSpacing / userLeading와 연동 */
+  --color-user-bg:        #f4f1ea;
+  --color-user-ink:       #1a1814;
+  --user-letter-spacing:  0em;
+  --user-line-height:     1.85;
 }
 
 html, body {
@@ -49,10 +67,8 @@ html, body {
 /* ── 1. 앱 루트 & 스크린 ─────────────────────────────────── */
 #app { width: 100%; height: 100%; position: relative; }
 
-.app-screen {
-  width: 100%; height: 100%;
-  position: absolute; inset: 0;
-}
+.app-screen { width: 100%; height: 100%; position: absolute; inset: 0; }
+
 
 /* ── 2. 업로더 스크린 ─────────────────────────────────────── */
 #screen-uploader {
@@ -73,6 +89,7 @@ html, body {
   width: 100%;
   max-width: 560px;
 }
+
 
 /* ── [UX#1] 드롭존 마이크로 인터랙션 ─────────────────────── */
 .dropzone {
@@ -106,12 +123,13 @@ html, body {
   box-shadow: 0 8px 32px rgba(90, 74, 58, 0.12);
 }
 
-/* [UX#1] drag-over 네온 그라데이션 테두리 */
+/* drag-over: 네온 그라데이션 테두리 */
 .dropzone.drag-over {
   border-style: solid;
   border-color: transparent;
   background: #eee8de;
-  background-image: linear-gradient(#eee8de, #eee8de),
+  background-image:
+    linear-gradient(#eee8de, #eee8de),
     linear-gradient(90deg, #c8b89a, #5a4a3a, #c8b89a);
   background-origin: border-box;
   background-clip: padding-box, border-box;
@@ -121,14 +139,12 @@ html, body {
 }
 
 @keyframes neon-border-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(200,184,154,0.4); }
-  50%       { box-shadow: 0 0 0 8px rgba(200,184,154,0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(200, 184, 154, 0.4); }
+  50%       { box-shadow: 0 0 0 8px rgba(200, 184, 154, 0); }
 }
 
-/* [UX#1] 드롭 완료 바운스 */
-.dropzone.drop-bounce {
-  animation: drop-bounce 0.55s var(--ease-spring);
-}
+/* 드롭 바운스 */
+.dropzone.drop-bounce { animation: drop-bounce 0.55s var(--ease-spring); }
 
 @keyframes drop-bounce {
   0%   { transform: scale(1); }
@@ -139,11 +155,12 @@ html, body {
 }
 
 .dropzone-icon {
-  font-size: 56px; line-height: 1;
-  filter: grayscale(0.2); margin-bottom: 4px;
+  font-size: 56px;
+  line-height: 1;
+  filter: grayscale(0.2);
+  margin-bottom: 4px;
   transition: transform 280ms var(--ease-spring);
 }
-
 .dropzone.drag-over .dropzone-icon { transform: scale(1.15) rotate(-4deg); }
 
 .dropzone h2 {
@@ -179,7 +196,6 @@ html, body {
   gap: 12px;
 }
 
-/* 스켈레톤 카드 */
 .skeleton-card {
   height: 160px; border-radius: 10px;
   background: linear-gradient(90deg, var(--color-border-soft) 25%, var(--color-paper-alt) 50%, var(--color-border-soft) 75%);
@@ -192,18 +208,13 @@ html, body {
   100% { background-position:  200% 0; }
 }
 
-/* 실제 도서 카드 */
 .book-card {
   position: relative; border-radius: 10px; overflow: hidden;
   background: var(--color-paper-alt); cursor: pointer;
   border: 1px solid var(--color-border);
   transition: transform 200ms var(--ease-out), box-shadow 200ms var(--ease-out);
 }
-
-.book-card:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 8px 24px var(--color-shadow);
-}
+.book-card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px var(--color-shadow); }
 
 .book-cover-placeholder {
   width: 100%; height: 120px;
@@ -275,8 +286,7 @@ html, body {
 .nav-action-btn.active { background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
 
 .reader-main-frame {
-  flex: 1 1 auto; position: relative; overflow: hidden;
-  display: flex; align-items: stretch;
+  flex: 1 1 auto; position: relative; overflow: hidden; display: flex; align-items: stretch;
 }
 
 #viewer-viewport { width: 100%; height: 100%; position: relative; overflow: hidden; }
@@ -304,7 +314,6 @@ html, body {
   letter-spacing: 0.03em; font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 
-/* 진행률 바 */
 .progress-bar-track {
   flex: 1 1 auto; height: 2px;
   background: var(--color-border-soft);
@@ -330,10 +339,8 @@ html, body {
   transition: opacity 200ms, background 200ms, color 200ms, transform 200ms;
   box-shadow: 0 2px 8px var(--color-shadow);
 }
-
 .floating-arrow-btn.prev { left: 8px; }
 .floating-arrow-btn.next { right: 8px; }
-
 .floating-arrow-btn:hover { opacity: 1; background: var(--color-ink); color: var(--color-paper); border-color: var(--color-ink); }
 .floating-arrow-btn.prev:hover { transform: translateY(-50%) translateX(-1px); }
 .floating-arrow-btn.next:hover { transform: translateY(-50%) translateX(1px); }
@@ -381,18 +388,15 @@ html, body {
   display: block; width: 100%; padding: 10px 20px;
   background: transparent; border: none; text-align: left;
   font-family: var(--font-ui); font-size: 13px; font-weight: 400;
-  color: var(--color-ink-soft); cursor: pointer; line-height: 1.5;
-  letter-spacing: -0.01em;
+  color: var(--color-ink-soft); cursor: pointer; line-height: 1.5; letter-spacing: -0.01em;
   transition: background 150ms, color 150ms, padding-left 150ms;
-  border-left: 2px solid transparent;
-  white-space: normal; word-break: break-word;
+  border-left: 2px solid transparent; white-space: normal; word-break: break-word;
 }
 .toc-item:hover { background: var(--color-paper-alt); color: var(--color-ink); padding-left: 24px; border-left-color: var(--color-accent-light); }
 .toc-item.active { background: var(--color-paper-alt); color: var(--color-ink); font-weight: 500; border-left-color: var(--color-accent); padding-left: 24px; }
 .toc-item[data-depth="2"] { padding-left: 32px; font-size: 12px; }
 .toc-item[data-depth="3"] { padding-left: 44px; font-size: 12px; color: var(--color-ink-muted); }
 
-/* [UX#16] 블러 오버레이 */
 .toc-sidebar-overlay {
   position: absolute; inset: 0; background: var(--color-overlay);
   z-index: 49; opacity: 0; pointer-events: none;
@@ -400,7 +404,7 @@ html, body {
 }
 .toc-sidebar-overlay.visible { opacity: 1; pointer-events: auto; }
 
-/* 블러 백드롭 (독서 화면 흐림) */
+/* [UX#16] 블러 백드롭 */
 .toc-sidebar-overlay.blur-backdrop {
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
@@ -426,13 +430,12 @@ html, body {
 
 .loading-overlay p { font-size: 13px; color: var(--color-ink-muted); font-weight: 400; letter-spacing: 0.01em; }
 
-/* [UX#20] 리사이즈 스피너 마스크 */
+/* [UX#20] 리사이즈 마스크 */
 .resize-mask {
   position: fixed; inset: 0; z-index: 9000;
-  background: rgba(252,251,247,0.85);
+  background: rgba(252,251,247,0.88);
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
-  transition: opacity 200ms;
 }
 .resize-mask p { font-size: 13px; color: var(--color-ink-muted); }
 
@@ -446,11 +449,9 @@ html, body {
 
 .toast {
   display: inline-flex; align-items: center;
-  padding: 10px 18px;
-  background: var(--color-toast-bg); color: var(--color-toast-text);
-  border-radius: 8px; font-size: 13px; font-weight: 400;
-  letter-spacing: -0.01em; line-height: 1.4;
-  max-width: 340px; text-align: center;
+  padding: 10px 18px; background: var(--color-toast-bg); color: var(--color-toast-text);
+  border-radius: 8px; font-size: 13px; font-weight: 400; letter-spacing: -0.01em;
+  line-height: 1.4; max-width: 340px; text-align: center;
   box-shadow: 0 4px 20px rgba(0,0,0,0.22);
   opacity: 0; transform: translateY(12px);
   animation: toast-in 280ms var(--ease-out) forwards;
@@ -471,16 +472,19 @@ html, body {
   border: 1px solid var(--color-border); border-radius: 12px;
   box-shadow: 0 8px 32px rgba(26,24,20,0.14), 0 2px 8px rgba(26,24,20,0.06);
   z-index: 60; display: flex; flex-direction: column; overflow: hidden;
-  opacity: 0; transform: translateY(-6px) scale(0.98);
-  transform-origin: top right;
+  opacity: 0; transform: translateY(-6px) scale(0.98); transform-origin: top right;
   transition: opacity var(--duration) var(--ease-out), transform var(--duration) var(--ease-out);
   pointer-events: none;
+  /* 내부 스크롤 허용 (커스텀 테마 빌더 노출 시) */
+  max-height: calc(100vh - var(--nav-height) - 20px);
+  overflow-y: auto;
 }
 .settings-panel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
 
 .settings-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 16px 12px; border-bottom: 1px solid var(--color-border-soft);
+  position: sticky; top: 0; background: inherit; z-index: 1;
 }
 .settings-title { font-size: 13px; font-weight: 600; color: var(--color-ink); letter-spacing: -0.01em; }
 .settings-close-btn {
@@ -521,7 +525,7 @@ html, body {
   min-width: 36px; text-align: center; font-variant-numeric: tabular-nums;
 }
 
-.theme-swatch-control { width: 100%; justify-content: flex-start; gap: 10px; }
+.theme-swatch-control { width: 100%; justify-content: flex-start; gap: 8px; flex-wrap: wrap; }
 .theme-swatch {
   display: flex; flex-direction: column; align-items: center; gap: 5px;
   background: transparent; border: none; cursor: pointer;
@@ -532,13 +536,85 @@ html, body {
   border: 2px solid var(--color-border);
   transition: border-color 150ms, transform 150ms;
 }
-.swatch-paper { background: #fcfbf7; }
-.swatch-dark  { background: #1a1a1e; }
-.swatch-white { background: #ffffff; }
+.swatch-paper  { background: #fcfbf7; }
+.swatch-dark   { background: #1a1a1e; }
+.swatch-white  { background: #ffffff; }
+/* [UX#23] 커스텀 테마 스와치: CSS 변수 사용 */
+.swatch-custom {
+  background: var(--color-user-bg, #f4f1ea);
+  border-color: var(--color-user-ink, #1a1814);
+}
 .theme-swatch:hover .swatch-preview,
 .theme-swatch.active .swatch-preview { border-color: var(--color-accent); transform: scale(1.06); }
 .swatch-name { font-size: 10px; font-weight: 400; color: var(--color-ink-muted); }
 .theme-swatch.active .swatch-name { color: var(--color-accent); font-weight: 600; }
+
+
+/* ── [UX#23] 커스텀 테마 빌더 ─────────────────────────────── */
+.custom-theme-builder {
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--color-paper-alt);
+  border-radius: 8px;
+  margin: 0 16px 8px;
+  border: 1px solid var(--color-border-soft);
+}
+
+.theme-builder-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.builder-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-ink-muted);
+  min-width: 30px;
+  flex-shrink: 0;
+}
+
+.builder-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+}
+
+.builder-input-wrap input[type="color"] {
+  width: 28px; height: 28px;
+  border: 1px solid var(--color-border); border-radius: 5px;
+  padding: 2px; cursor: pointer; background: transparent;
+  flex-shrink: 0;
+}
+
+.builder-input-wrap input[type="text"] {
+  flex: 1; padding: 4px 8px;
+  border: 1px solid var(--color-border); border-radius: 5px;
+  font-family: var(--font-ui); font-size: 11px; font-weight: 500;
+  background: transparent; color: var(--color-ink);
+  letter-spacing: 0.04em; outline: none;
+  transition: border-color 150ms;
+}
+.builder-input-wrap input[type="text"]:focus { border-color: var(--color-accent); }
+
+.theme-builder-row input[type="range"] {
+  flex: 1; height: 4px; appearance: none; -webkit-appearance: none;
+  background: var(--color-border); border-radius: 2px; outline: none; cursor: pointer;
+}
+.theme-builder-row input[type="range"]::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--color-accent); cursor: pointer;
+  border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+}
+
+.builder-val {
+  font-size: 10px; font-weight: 500; color: var(--color-ink-muted);
+  min-width: 28px; text-align: right; font-variant-numeric: tabular-nums;
+}
 
 
 /* ── 9. 모달 공통 ─────────────────────────────────────────── */
@@ -582,16 +658,25 @@ html, body {
   outline: none; transition: border-color 150ms;
 }
 .search-input-row input:focus { border-color: var(--color-accent); }
+
+/* [UX#22] 가상 스크롤 검색 결과 컨테이너 */
 .search-results {
-  max-height: 320px; overflow-y: auto;
+  max-height: 340px; overflow-y: auto;
   scrollbar-width: thin; scrollbar-color: var(--color-border) transparent;
+  contain: content; /* 레이아웃 격리 최적화 */
 }
 
-/* [UX#13] mark 하이라이트 */
 .search-result-item:hover { background: var(--color-paper-alt); }
+
+/* [UX#13] mark 하이라이트 */
 mark.fable-search-mark {
   background: rgba(255,220,50,0.55);
   color: inherit; padding: 0 1px; border-radius: 2px; font-weight: 500;
+  animation: mark-pulse 0.6s ease-out;
+}
+@keyframes mark-pulse {
+  0%   { background: rgba(255,165,0,0.8); }
+  100% { background: rgba(255,220,50,0.55); }
 }
 
 /* 통계 */
@@ -602,7 +687,7 @@ mark.fable-search-mark {
 .stats-label { color: var(--color-ink-muted); font-size: 12px; }
 .stats-divider { height: 1px; background: var(--color-border-soft); margin: 4px 0; }
 
-/* [UX#15] 목표 달성 프로그레시브 바 */
+/* [UX#15] 목표 탄력 모션 */
 .goal-track {
   height: 8px; border-radius: 4px; background: var(--color-border-soft);
   overflow: hidden; margin-top: 8px;
@@ -627,9 +712,7 @@ mark.fable-search-mark {
 }
 .tts-label { font-size: 12px; white-space: nowrap; flex-shrink: 0; }
 .tts-progress-wrap { flex: 1; }
-.tts-progress-track {
-  height: 3px; background: rgba(255,255,255,0.2); border-radius: 2px; overflow: hidden;
-}
+.tts-progress-track { height: 3px; background: rgba(255,255,255,0.2); border-radius: 2px; overflow: hidden; }
 .tts-progress-fill {
   height: 100%; width: 0%; background: var(--color-accent-light);
   transition: width 200ms linear; border-radius: 2px;
@@ -637,7 +720,7 @@ mark.fable-search-mark {
 .tts-controls { display: flex; gap: 6px; flex-shrink: 0; }
 
 
-/* ── 11. [UX#14] 컨텍스트 메뉴 (슬라이드업) ─────────────── */
+/* ── 11. [UX#14] 컨텍스트 메뉴 ──────────────────────────── */
 .context-menu {
   position: fixed; bottom: 0; left: 0; right: 0;
   z-index: 400; background: var(--color-paper);
@@ -648,11 +731,7 @@ mark.fable-search-mark {
   box-shadow: 0 -8px 32px rgba(0,0,0,0.14);
 }
 .context-menu.slide-up { animation: slide-up 280ms var(--ease-out); }
-
-@keyframes slide-up {
-  from { transform: translateY(100%); opacity: 0; }
-  to   { transform: translateY(0);    opacity: 1; }
-}
+@keyframes slide-up { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 
 .ctx-btn {
   flex: 1; padding: 10px 8px;
@@ -717,7 +796,7 @@ kbd {
   animation: dot-pulse 1.5s ease-in-out infinite;
 }
 @keyframes banner-in { from { transform: translateY(-100%); } to { transform: translateY(0); } }
-@keyframes dot-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes dot-pulse  { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 
 /* ── 14. [UX#19] 맨위로 버튼 ─────────────────────────────── */
@@ -729,13 +808,13 @@ kbd {
   display: flex; align-items: center; justify-content: center;
   opacity: 0.7; box-shadow: 0 4px 16px var(--color-shadow);
   transition: opacity 200ms, transform 200ms;
-  animation: toast-in 280ms var(--ease-out);
 }
 .scroll-top-btn:hover { opacity: 1; transform: translateY(-2px); }
 
 
 /* ── 15. [UX#7] 다크 테마 대비 조정 ─────────────────────── */
 body[data-theme="dark"] { background: #1a1a1e; }
+
 body[data-theme="dark"] #screen-viewer,
 body[data-theme="dark"] .viewer-nav-bar,
 body[data-theme="dark"] .viewer-bottom-bar,
@@ -744,7 +823,8 @@ body[data-theme="dark"] .settings-panel,
 body[data-theme="dark"] .toc-sidebar {
   background: #1a1a1e; border-color: #2e2e34; color: #c8c6c0;
 }
-/* [UX#7] 다크 전용 대비 미세 하향 */
+
+/* [UX#7] 다크: 전체 대비 미세 하향 */
 body[data-theme="dark"] .reader-main-frame { filter: contrast(0.96); }
 body[data-theme="dark"] .nav-title-area,
 body[data-theme="dark"] .viewer-bottom-bar span { color: #7a7874; }
@@ -756,8 +836,8 @@ body[data-theme="dark"] .floating-arrow-btn:hover { background: #2e2e34; border-
 body[data-theme="dark"] .progress-bar-track { background: #2e2e34; }
 body[data-theme="dark"] .progress-bar-fill  { background: #5a5a64; }
 body[data-theme="dark"] .settings-panel { box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
-body[data-theme="dark"] .settings-title { color: #c8c6c0; }
-body[data-theme="dark"] .settings-label { color: #5a5a64; }
+body[data-theme="dark"] .settings-title  { color: #c8c6c0; }
+body[data-theme="dark"] .settings-label  { color: #5a5a64; }
 body[data-theme="dark"] .settings-divider { background: #2e2e34; }
 body[data-theme="dark"] .ctrl-btn { background: #242428; border-color: #2e2e34; color: #909090; }
 body[data-theme="dark"] .ctrl-btn:hover,
@@ -789,6 +869,11 @@ body[data-theme="dark"] .stats-divider { background: #2e2e34; }
 body[data-theme="dark"] .context-menu { background: #1a1a1e; border-color: #2e2e34; }
 body[data-theme="dark"] .ctx-btn { background: #242428; border-color: #2e2e34; color: #909090; }
 body[data-theme="dark"] .ctx-btn:hover { background: #3a3a42; color: #e0e0e0; }
+body[data-theme="dark"] .custom-theme-builder { background: #242428; border-color: #2e2e34; }
+body[data-theme="dark"] .builder-label { color: #5a5a64; }
+body[data-theme="dark"] .builder-input-wrap input[type="text"] { border-color: #2e2e34; color: #c8c6c0; }
+body[data-theme="dark"] .builder-val { color: #5a5a64; }
+body[data-theme="dark"] .theme-builder-row input[type="range"] { background: #2e2e34; }
 
 /* 화이트 테마 */
 body[data-theme="white"] { background: #ffffff; }
@@ -832,6 +917,7 @@ body[data-theme="white"] .resize-mask { background: #fff; }
   .viewer-bottom-bar span { font-size: 10px; }
   .settings-panel { right: 0; border-top-right-radius: 0; border-top-left-radius: 0; border-top: none; }
   .tts-bar { min-width: 90vw; }
+  .theme-builder-row { flex-wrap: wrap; }
 }
 
 @media (max-width: 380px) {

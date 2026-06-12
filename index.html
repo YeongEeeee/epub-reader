@@ -3,7 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Fable — Premium EPUB Reader</title>
+  <title>Fable v3 — Premium EPUB Reader</title>
+
+  <!-- FOUC 차단: 저장된 테마를 즉시 body에 적용 -->
+  <script>
+    (function(){
+      try {
+        const s = localStorage.getItem('fable_v3_state');
+        if (s) {
+          const p = JSON.parse(s);
+          if (p.theme && p.theme !== 'paper') document.documentElement.setAttribute('data-theme', p.theme);
+          if (p.userBg)  document.documentElement.style.setProperty('--color-user-bg',  p.userBg);
+          if (p.userInk) document.documentElement.style.setProperty('--color-user-ink', p.userInk);
+        }
+      } catch(_) {}
+    })();
+  </script>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,95 +35,109 @@
 <div id="app">
 
   <!-- ══ 업로더 스크린 ══════════════════════════════════════ -->
-  <div id="screen-uploader" class="app-screen">
+  <div id="screen-uploader" class="app-screen" role="main">
 
     <!-- [UX#18] 오프라인 배너 -->
-    <div id="offline-banner" class="offline-banner" aria-live="polite" style="display:none;">
-      <span class="offline-dot"></span>오프라인 모드로 안전하게 작동 중입니다
+    <div id="offline-banner" class="offline-banner" role="status" aria-live="polite" style="display:none;">
+      <span class="offline-dot" aria-hidden="true"></span>
+      <span>오프라인 모드로 안전하게 작동 중입니다</span>
     </div>
 
     <div class="uploader-inner">
       <!-- [UX#1] 드롭존 마이크로 인터랙션 -->
-      <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="EPUB 파일 업로드">
-        <div class="dropzone-icon" id="dropzone-icon">📚</div>
-        <h2>EPUB 파일을 여기에 드래그 앤 드롭하세요</h2>
-        <p>또는 파일 시스템에서 직접 선택</p>
-        <input type="file" id="file-input" accept=".epub" style="display:none;">
+      <div class="dropzone" id="dropzone" role="button" tabindex="0"
+           aria-label="EPUB 파일 업로드. 드래그 앤 드롭 또는 클릭하여 선택"
+           aria-describedby="dropzone-hint">
+        <div class="dropzone-icon" id="dropzone-icon" aria-hidden="true">📚</div>
+        <h2>EPUB 파일을 드래그하거나 선택하세요</h2>
+        <p id="dropzone-hint">epub 형식 지원 · 최대 300 MB</p>
+        <input type="file" id="file-input" accept=".epub" style="display:none;" aria-hidden="true">
         <button type="button" class="btn-select" id="btn-file-select">파일 선택</button>
       </div>
 
-      <!-- [UX#2] 오프라인 서재 -->
-      <section class="library-section">
+      <!-- [UX#2] 오프라인 서재 (스켈레톤 UI) -->
+      <section class="library-section" aria-label="내 서재">
         <h3 class="library-title">내 서재</h3>
-        <!-- 스켈레톤 UI 초기 노출, JS로 교체 -->
-        <div id="library-grid" class="library-grid">
-          <div class="skeleton-card"></div>
-          <div class="skeleton-card"></div>
-          <div class="skeleton-card"></div>
+        <div id="library-grid" class="library-grid" role="list" aria-label="저장된 도서 목록">
+          <div class="skeleton-card" aria-hidden="true"></div>
+          <div class="skeleton-card" aria-hidden="true"></div>
+          <div class="skeleton-card" aria-hidden="true"></div>
         </div>
       </section>
     </div>
   </div><!-- /screen-uploader -->
 
   <!-- ══ 뷰어 스크린 ══════════════════════════════════════ -->
-  <div id="screen-viewer" class="app-screen" style="display:none;">
+  <div id="screen-viewer" class="app-screen" style="display:none;" role="main" aria-label="EPUB 뷰어">
 
-    <!-- [UX#18] 오프라인 배너 (뷰어용) -->
-    <div id="offline-banner-viewer" class="offline-banner offline-banner--viewer" aria-live="polite" style="display:none;">
-      <span class="offline-dot"></span>오프라인 모드
+    <!-- [UX#18] 오프라인 배너 뷰어용 -->
+    <div id="offline-banner-viewer" class="offline-banner offline-banner--viewer"
+         role="status" aria-live="polite" style="display:none;">
+      <span class="offline-dot" aria-hidden="true"></span>
+      <span>오프라인 모드</span>
     </div>
 
-    <!-- [UX#5] 상단 내비게이션 바 (슬라이딩 토글 대상) -->
-    <header class="viewer-nav-bar" id="viewer-nav-bar">
+    <!-- [UX#5] 상단 내비게이션 바 -->
+    <header class="viewer-nav-bar" id="viewer-nav-bar" role="banner">
       <div class="nav-left">
-        <button class="nav-action-btn" id="btn-toc-toggle" title="목차">☰ 목차</button>
+        <button class="nav-action-btn" id="btn-toc-toggle" title="목차 열기/닫기"
+                aria-expanded="false" aria-controls="toc-sidebar">☰ 목차</button>
       </div>
-      <div class="nav-title-area" id="nav-book-title">도서 로딩 중...</div>
+      <div class="nav-title-area" id="nav-book-title" aria-live="polite" aria-label="현재 도서 제목">도서 로딩 중...</div>
       <div class="nav-right">
-        <button class="nav-action-btn" id="btn-search-toggle" title="검색">🔍</button>
-        <button class="nav-action-btn" id="btn-annotation-toggle" title="하이라이트">✏️</button>
-        <button class="nav-action-btn" id="btn-stats-toggle" title="통계">📊</button>
-        <button class="nav-action-btn" id="btn-settings-toggle" title="설정">⚙ 설정</button>
-        <button class="nav-action-btn" id="btn-close-viewer" title="닫기">✕ 닫기</button>
+        <button class="nav-action-btn" id="btn-search-toggle" title="전문 검색"
+                aria-label="도서 전문 검색" aria-haspopup="dialog">🔍</button>
+        <button class="nav-action-btn" id="btn-annotation-toggle" title="TTS 낭독 시작"
+                aria-label="TTS 낭독">✏️</button>
+        <button class="nav-action-btn" id="btn-stats-toggle" title="독서 통계"
+                aria-label="독서 통계 보기" aria-haspopup="dialog">📊</button>
+        <button class="nav-action-btn" id="btn-settings-toggle" title="독서 설정"
+                aria-label="독서 설정 패널 열기/닫기"
+                aria-expanded="false" aria-controls="settings-panel">⚙ 설정</button>
+        <button class="nav-action-btn" id="btn-close-viewer" title="뷰어 닫기"
+                aria-label="뷰어를 닫고 서재로 돌아가기">✕ 닫기</button>
       </div>
     </header>
 
     <!-- 본문 뷰포트 -->
-    <main class="reader-main-frame" id="reader-main-frame">
-      <button class="floating-arrow-btn prev" id="arrow-prev" aria-label="이전 페이지">◀</button>
-      <div id="viewer-viewport"></div>
-      <button class="floating-arrow-btn next" id="arrow-next" aria-label="다음 페이지">▶</button>
+    <main class="reader-main-frame" id="reader-main-frame" aria-label="책 본문">
+      <button class="floating-arrow-btn prev" id="arrow-prev"
+              aria-label="이전 페이지" title="이전 페이지 (← 방향키)">◀</button>
+      <div id="viewer-viewport" role="document" aria-label="EPUB 본문 렌더링 영역"></div>
+      <button class="floating-arrow-btn next" id="arrow-next"
+              aria-label="다음 페이지" title="다음 페이지 (→ 방향키)">▶</button>
     </main>
 
-    <!-- [UX#5] 하단 상태 바 (슬라이딩 토글 대상) -->
-    <footer class="viewer-bottom-bar" id="viewer-bottom-bar">
-      <span id="viewer-progress-text">0%</span>
-      <div class="progress-bar-track">
+    <!-- [UX#5] 하단 상태 바 -->
+    <footer class="viewer-bottom-bar" id="viewer-bottom-bar" role="contentinfo">
+      <span id="viewer-progress-text" aria-live="polite" aria-label="읽기 진행률">0%</span>
+      <div class="progress-bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
         <div class="progress-bar-fill" id="progress-bar-fill"></div>
       </div>
-      <span id="reading-location-range">- / -</span>
+      <span id="reading-location-range" aria-live="polite" aria-label="현재 위치 범위">- / -</span>
     </footer>
 
-    <!-- [UX#19] 스크롤 모드 맨위로 버튼 -->
-    <button class="scroll-top-btn" id="btn-scroll-top" aria-label="맨 위로" style="display:none;">↑</button>
+    <!-- [UX#19] 스크롤 맨위로 버튼 -->
+    <button class="scroll-top-btn" id="btn-scroll-top" aria-label="페이지 맨 위로 이동" style="display:none;">↑</button>
 
     <!-- 목차 사이드바 -->
-    <aside id="toc-sidebar" class="toc-sidebar">
+    <aside id="toc-sidebar" class="toc-sidebar" role="navigation" aria-label="목차">
       <div class="toc-header">
-        <h3>목차</h3>
+        <h3 id="toc-heading">목차</h3>
         <button id="btn-toc-close" aria-label="목차 닫기">✕</button>
       </div>
-      <div id="toc-list" class="toc-list"></div>
+      <div id="toc-list" class="toc-list" role="list" aria-labelledby="toc-heading"></div>
     </aside>
     <!-- [UX#16] 블러 오버레이 -->
-    <div id="toc-overlay" class="toc-sidebar-overlay"></div>
+    <div id="toc-overlay" class="toc-sidebar-overlay" role="presentation" aria-hidden="true"></div>
 
     <!-- [UX#17] 키보드 단축키 팁 레이어 -->
-    <div id="keyboard-hint-layer" class="keyboard-hint-layer" style="display:none;">
+    <div id="keyboard-hint-layer" class="keyboard-hint-layer" role="dialog"
+         aria-modal="true" aria-labelledby="hint-title" style="display:none;">
       <div class="keyboard-hint-box">
-        <p class="keyboard-hint-title">⌨ 키보드 단축키</p>
-        <ul>
-          <li><kbd>←</kbd><kbd>→</kbd> 페이지 이동</li>
+        <p class="keyboard-hint-title" id="hint-title">⌨ 키보드 단축키</p>
+        <ul role="list">
+          <li><kbd aria-label="왼쪽 방향키">←</kbd><kbd aria-label="오른쪽 방향키">→</kbd> 페이지 이동</li>
           <li><kbd>Space</kbd> 다음 페이지</li>
           <li><kbd>Backspace</kbd> 이전 페이지</li>
           <li><kbd>Esc</kbd> 뷰어 닫기</li>
@@ -118,109 +147,169 @@
     </div>
 
     <!-- ── 설정 패널 ── -->
-    <div id="settings-panel" class="settings-panel" role="dialog" aria-label="독서 설정">
+    <div id="settings-panel" class="settings-panel" role="dialog"
+         aria-modal="true" aria-labelledby="settings-title">
       <div class="settings-header">
-        <span class="settings-title">독서 설정</span>
+        <span class="settings-title" id="settings-title">독서 설정</span>
         <button class="settings-close-btn" id="btn-settings-close" aria-label="설정 닫기">✕</button>
       </div>
 
-      <div class="settings-row">
-        <span class="settings-label">보기 모드</span>
-        <div class="settings-control">
-          <button class="ctrl-btn ctrl-btn--text active" id="btn-view-paginated" data-flow="paginated">가로</button>
-          <button class="ctrl-btn ctrl-btn--text" id="btn-view-scrolled" data-flow="scrolled">세로</button>
+      <!-- 보기 모드 -->
+      <div class="settings-row" role="group" aria-label="보기 모드">
+        <span class="settings-label" id="lbl-flow">보기 모드</span>
+        <div class="settings-control" role="radiogroup" aria-labelledby="lbl-flow">
+          <button class="ctrl-btn ctrl-btn--text active" id="btn-view-paginated"
+                  data-flow="paginated" role="radio" aria-checked="true">가로</button>
+          <button class="ctrl-btn ctrl-btn--text" id="btn-view-scrolled"
+                  data-flow="scrolled" role="radio" aria-checked="false">세로</button>
         </div>
       </div>
       <div class="settings-divider"></div>
 
-      <div class="settings-row">
-        <span class="settings-label">글자 크기</span>
+      <!-- 글자 크기 -->
+      <div class="settings-row" role="group" aria-label="글자 크기">
+        <span class="settings-label" id="lbl-font">글자 크기</span>
         <div class="settings-control">
-          <button class="ctrl-btn" id="btn-font-decrease">A−</button>
-          <span class="ctrl-value" id="font-size-display">100%</span>
-          <button class="ctrl-btn" id="btn-font-increase">A+</button>
+          <button class="ctrl-btn" id="btn-font-decrease" aria-label="글자 크기 줄이기">A−</button>
+          <span class="ctrl-value" id="font-size-display" aria-live="polite" aria-label="현재 글자 크기">100%</span>
+          <button class="ctrl-btn" id="btn-font-increase" aria-label="글자 크기 키우기">A+</button>
         </div>
       </div>
       <div class="settings-divider"></div>
 
-      <div class="settings-row">
-        <span class="settings-label">줄 간격</span>
-        <div class="settings-control">
-          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-narrow" data-lh="narrow">좁게</button>
-          <button class="ctrl-btn ctrl-btn--text active" id="btn-lh-normal" data-lh="normal">보통</button>
-          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-wide" data-lh="wide">넓게</button>
+      <!-- 줄 간격 -->
+      <div class="settings-row" role="group" aria-label="줄 간격">
+        <span class="settings-label" id="lbl-lh">줄 간격</span>
+        <div class="settings-control" role="radiogroup" aria-labelledby="lbl-lh">
+          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-narrow" data-lh="narrow"
+                  role="radio" aria-checked="false">좁게</button>
+          <button class="ctrl-btn ctrl-btn--text active" id="btn-lh-normal" data-lh="normal"
+                  role="radio" aria-checked="true">보통</button>
+          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-wide" data-lh="wide"
+                  role="radio" aria-checked="false">넓게</button>
         </div>
       </div>
       <div class="settings-divider"></div>
 
-      <div class="settings-row settings-row--column">
-        <span class="settings-label">배경 테마</span>
-        <div class="settings-control theme-swatch-control">
-          <button class="theme-swatch active" data-theme="paper" aria-label="종이 테마">
-            <span class="swatch-preview swatch-paper"></span>
+      <!-- 배경 테마 -->
+      <div class="settings-row settings-row--column" role="group" aria-label="배경 테마">
+        <span class="settings-label" id="lbl-theme">배경 테마</span>
+        <div class="settings-control theme-swatch-control" role="radiogroup" aria-labelledby="lbl-theme">
+          <button class="theme-swatch active" data-theme="paper" role="radio" aria-checked="true" aria-label="종이 테마">
+            <span class="swatch-preview swatch-paper" aria-hidden="true"></span>
             <span class="swatch-name">종이</span>
           </button>
-          <button class="theme-swatch" data-theme="dark" aria-label="다크 테마">
-            <span class="swatch-preview swatch-dark"></span>
+          <button class="theme-swatch" data-theme="dark" role="radio" aria-checked="false" aria-label="다크 테마">
+            <span class="swatch-preview swatch-dark" aria-hidden="true"></span>
             <span class="swatch-name">다크</span>
           </button>
-          <button class="theme-swatch" data-theme="white" aria-label="화이트 테마">
-            <span class="swatch-preview swatch-white"></span>
+          <button class="theme-swatch" data-theme="white" role="radio" aria-checked="false" aria-label="화이트 테마">
+            <span class="swatch-preview swatch-white" aria-hidden="true"></span>
             <span class="swatch-name">화이트</span>
+          </button>
+          <!-- [UX#23] 커스텀 테마 -->
+          <button class="theme-swatch" data-theme="custom" role="radio" aria-checked="false" aria-label="커스텀 테마">
+            <span class="swatch-preview swatch-custom" aria-hidden="true"></span>
+            <span class="swatch-name">커스텀</span>
           </button>
         </div>
       </div>
       <div class="settings-divider"></div>
 
+      <!-- [UX#23] 커스텀 테마 빌더 -->
+      <div id="custom-theme-builder" class="custom-theme-builder" role="group" aria-label="커스텀 테마 색상 설정" style="display:none;">
+        <div class="theme-builder-row">
+          <label class="builder-label" for="input-user-bg">배경색</label>
+          <div class="builder-input-wrap">
+            <input type="color" id="input-user-bg" value="#f4f1ea" aria-label="배경 색상 선택">
+            <input type="text"  id="input-user-bg-hex" value="#f4f1ea" maxlength="7"
+                   aria-label="배경 색상 16진수 입력" placeholder="#f4f1ea">
+          </div>
+        </div>
+        <div class="theme-builder-row">
+          <label class="builder-label" for="input-user-ink">글자색</label>
+          <div class="builder-input-wrap">
+            <input type="color" id="input-user-ink" value="#1a1814" aria-label="글자 색상 선택">
+            <input type="text"  id="input-user-ink-hex" value="#1a1814" maxlength="7"
+                   aria-label="글자 색상 16진수 입력" placeholder="#1a1814">
+          </div>
+        </div>
+        <div class="theme-builder-row">
+          <label class="builder-label" for="input-user-spacing">자간</label>
+          <input type="range" id="input-user-spacing" min="-0.05" max="0.2" step="0.01" value="0"
+                 aria-label="자간 조절" aria-valuemin="-0.05" aria-valuemax="0.2">
+          <span class="builder-val" id="spacing-val">0em</span>
+        </div>
+        <div class="theme-builder-row">
+          <label class="builder-label" for="input-user-leading">행간</label>
+          <input type="range" id="input-user-leading" min="1.2" max="3.0" step="0.05" value="1.85"
+                 aria-label="행간 조절" aria-valuemin="1.2" aria-valuemax="3.0">
+          <span class="builder-val" id="leading-val">1.85</span>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+
+      <!-- 사용자 폰트 업로드 -->
       <div class="settings-row settings-row--column">
         <span class="settings-label">사용자 폰트 업로드</span>
-        <input type="file" id="font-uploader" accept=".ttf,.otf,.woff,.woff2" style="font-size:11px;">
+        <input type="file" id="font-uploader" accept=".ttf,.otf,.woff,.woff2"
+               style="font-size:11px;" aria-label="커스텀 폰트 파일 선택 (.ttf, .otf, .woff, .woff2)">
       </div>
     </div><!-- /settings-panel -->
 
     <!-- ── 검색 모달 ── -->
-    <div id="search-modal" class="modal-overlay" style="display:none;" role="dialog" aria-label="전문 검색">
+    <div id="search-modal" class="modal-overlay" style="display:none;"
+         role="dialog" aria-modal="true" aria-labelledby="search-modal-title">
       <div class="modal-box">
         <div class="modal-header">
-          <h3>🔍 도서 전문 검색</h3>
-          <button class="modal-close-btn" id="btn-search-modal-close">✕</button>
+          <h3 id="search-modal-title">🔍 도서 전문 검색</h3>
+          <button class="modal-close-btn" id="btn-search-modal-close" aria-label="검색 창 닫기">✕</button>
         </div>
         <div class="modal-body">
-          <div class="search-input-row">
-            <input type="text" id="input-search-query" placeholder="검색어 입력 (2글자 이상)" autocomplete="off">
-            <button id="btn-execute-search" class="ctrl-btn">검색</button>
+          <div class="search-input-row" role="search">
+            <input type="search" id="input-search-query"
+                   placeholder="검색어 입력 (2글자 이상)" autocomplete="off"
+                   aria-label="도서 내 검색어 입력" aria-controls="search-results-container">
+            <button id="btn-execute-search" class="ctrl-btn" aria-label="검색 실행">검색</button>
           </div>
-          <div id="search-results-container" class="search-results"></div>
+          <!-- [UX#22] 가상 스크롤 컨테이너 -->
+          <div id="search-results-container" class="search-results"
+               role="listbox" aria-label="검색 결과 목록" aria-live="polite">
+            <!-- 가상 스크롤 센티널 & 결과 동적 주입 -->
+          </div>
         </div>
       </div>
     </div>
 
     <!-- ── 통계/목표 모달 ── -->
-    <div id="stats-modal" class="modal-overlay" style="display:none;" role="dialog" aria-label="독서 통계">
+    <div id="stats-modal" class="modal-overlay" style="display:none;"
+         role="dialog" aria-modal="true" aria-labelledby="stats-modal-title">
       <div class="modal-box">
         <div class="modal-header">
-          <h3>📊 독서 분석</h3>
-          <button class="modal-close-btn" id="btn-stats-modal-close">✕</button>
+          <h3 id="stats-modal-title">📊 독서 분석</h3>
+          <button class="modal-close-btn" id="btn-stats-modal-close" aria-label="통계 창 닫기">✕</button>
         </div>
         <div class="modal-body">
           <div class="stats-row">
             <span class="stats-label">오늘 독서 시간</span>
-            <strong id="stat-reading-time">0분 0초</strong>
+            <strong id="stat-reading-time" aria-live="polite">0분 0초</strong>
           </div>
           <div class="stats-row">
             <span class="stats-label">읽은 위치 포인트</span>
-            <strong id="stat-pages-read">0</strong>
+            <strong id="stat-pages-read" aria-live="polite">0</strong>
           </div>
           <div class="stats-divider"></div>
           <div class="stats-row">
             <span class="stats-label">일일 목표 (분)</span>
             <div style="display:flex;gap:6px;align-items:center;">
-              <input type="number" id="input-reading-goal" value="30" min="1" max="999" style="width:56px;padding:4px 8px;border:1px solid var(--color-border);border-radius:6px;font-size:13px;background:transparent;color:var(--color-ink);">
-              <button id="btn-save-goal" class="ctrl-btn">저장</button>
+              <input type="number" id="input-reading-goal" value="30" min="1" max="999"
+                     aria-label="일일 독서 목표 분 단위 입력"
+                     style="width:56px;padding:4px 8px;border:1px solid var(--color-border);border-radius:6px;font-size:13px;background:transparent;color:var(--color-ink);">
+              <button id="btn-save-goal" class="ctrl-btn" aria-label="독서 목표 저장">저장</button>
             </div>
           </div>
-          <!-- [UX#15] 목표 달성 프로그레시브 바 -->
-          <div class="goal-track">
+          <div class="goal-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+               aria-valuenow="0" aria-label="독서 목표 달성률">
             <div class="goal-fill" id="goal-progress-fill"></div>
           </div>
         </div>
@@ -228,28 +317,30 @@
     </div>
 
     <!-- ── TTS 플레이어 바 ── -->
-    <div id="tts-player-bar" class="tts-bar" style="display:none;">
-      <span class="tts-label" id="tts-status-text">🔊 낭독 중...</span>
-      <div class="tts-progress-wrap">
+    <div id="tts-player-bar" class="tts-bar" style="display:none;" role="toolbar" aria-label="TTS 낭독 컨트롤">
+      <span class="tts-label" id="tts-status-text" aria-live="polite">🔊 낭독 중...</span>
+      <div class="tts-progress-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+           aria-valuenow="0" aria-label="TTS 진행률">
         <div class="tts-progress-track">
           <div class="tts-progress-fill" id="tts-progress-fill"></div>
         </div>
       </div>
       <div class="tts-controls">
-        <button class="ctrl-btn" id="btn-tts-play-pause">⏸</button>
-        <button class="ctrl-btn" id="btn-tts-stop">⏹</button>
+        <button class="ctrl-btn" id="btn-tts-play-pause" aria-label="일시정지">⏸</button>
+        <button class="ctrl-btn" id="btn-tts-stop" aria-label="정지">⏹</button>
       </div>
     </div>
 
-    <!-- ── 하이라이트 사이드 패널 (동적 생성, 앵커 위치만 선언) ── -->
-    <div id="annotation-panel-anchor"></div>
+    <!-- ── 하이라이트 패널 앵커 ── -->
+    <div id="annotation-panel-anchor" aria-hidden="true"></div>
 
-    <!-- ── 모바일 컨텍스트 메뉴 ── [UX#14] -->
-    <div id="context-menu" class="context-menu" style="display:none;">
-      <button class="ctx-btn" id="ctx-highlight">🖊 하이라이트</button>
-      <button class="ctx-btn" id="ctx-copy">⎘ 복사</button>
-      <button class="ctx-btn" id="ctx-tts">🔊 낭독</button>
-      <button class="ctx-btn" id="ctx-search">🔍 검색</button>
+    <!-- ── [UX#14] 모바일 컨텍스트 메뉴 ── -->
+    <div id="context-menu" class="context-menu" style="display:none;"
+         role="menu" aria-label="텍스트 선택 메뉴">
+      <button class="ctx-btn" id="ctx-highlight" role="menuitem">🖊 하이라이트</button>
+      <button class="ctx-btn" id="ctx-copy"      role="menuitem">⎘ 복사</button>
+      <button class="ctx-btn" id="ctx-tts"       role="menuitem">🔊 낭독</button>
+      <button class="ctx-btn" id="ctx-search"    role="menuitem">🔍 검색</button>
     </div>
 
   </div><!-- /screen-viewer -->
@@ -257,11 +348,11 @@
 </div><!-- /app -->
 
 <!-- 전역 토스트 컨테이너 -->
-<div id="global-toast-container" class="toast-container" aria-live="polite"></div>
+<div id="global-toast-container" class="toast-container" aria-live="assertive" aria-atomic="false"></div>
 
-<!-- [UX#20] 리사이즈 마스크 (동적 생성용 앵커) -->
-<div id="resize-mask" class="resize-mask" style="display:none;">
-  <div class="spinner"></div>
+<!-- [UX#20] 리사이즈 마스크 -->
+<div id="resize-mask" class="resize-mask" style="display:none;" role="status" aria-live="polite">
+  <div class="spinner" aria-hidden="true"></div>
   <p>화면 조정 중...</p>
 </div>
 

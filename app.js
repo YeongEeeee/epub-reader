@@ -1,183 +1,277 @@
 /**
  * ============================================================
- * Fable v2 Premium — app.js
- * epub.js 0.3.93 기반 고도화 싱글-코어 아키텍처
+ * Fable v3 Premium — app.js
+ * Proxy 기반 리액티브 아키텍처 · Error Boundary · 자원 해제 파이프라인
  *
- * UX 고도화 20선 통합:
- *  #1  드롭존 마이크로 인터랙션 (네온 그라데이션 + 바운스)
- *  #2  서재 스켈레톤 UI
- *  #3  가로↔세로 뷰 전환 CFI 보정 스케줄러
- *  #4  뷰포트 크로스페이드 트랜지션
- *  #5  상/하단 바 슬라이딩 토글
- *  #6  진행률 인디케이터 즉각 연동
- *  #7  다크 테마 대비 미세 조정
- *  #8  논블로킹 스택 토스트
- *  #9  모바일 스와이프 엣지 가드
- *  #10 LRU 자동 퇴거 알림
- *  #11 TTS 진행 바 리뉴얼
- *  #12 폰트 업로드 샌드박스 안정화
- *  #13 검색 결과 mark 하이라이트
- *  #14 롱프레스 컨텍스트 메뉴
- *  #15 목표 달성 탄력 모션
- *  #16 TOC 블러 오버레이
- *  #17 키보드 단축키 팁 레이어
- *  #18 오프라인 상태 배너
- *  #19 스크롤 맨위로 버튼
- *  #20 리사이즈 디바운스 + 스피너 마스크
+ * 필수 요구사항:
+ *  [R1] Proxy 기반 Reactive Store — syncSettingsUI 폐기
+ *  [R2] Null-Safe DOMProxy (Null Object Pattern)
+ *  [R2b] FOUC 뮤텍스 가드 (rendition.hooks + rendered)
+ *  [R2c] 메모리 누수 자원 해제 파이프라인
+ *  [R3] Error Boundary Manager (도메인 격리)
+ *
+ * UX 고도화 20선 + 초고급 상용 스펙 3선:
+ *  #21 오프라인 하이라이트 충돌 해결 엔진 (UUID + LWW Merge)
+ *  #22 가상 스크롤 검색 레이어 (IntersectionObserver 재활용 풀)
+ *  #23 커스텀 테마 빌더 (CSS Variable 실시간 주입 + epub.js 관통)
  * ============================================================
  */
 
 'use strict';
 
 /* ══════════════════════════════════════════════════════════
-   0. 전역 상태
+   §0. 상수
    ══════════════════════════════════════════════════════════ */
-const ReaderState = {
-  book:              null,
-  rendition:         null,
-  toc:               [],
-  currentHref:       '',
-  totalLocations:    0,
-  currentCFI:        '',
-  isTocOpen:         false,
-  isSettingsOpen:    false,
-  bookKey:           '',
-  indexedDB:         null,
-  navBarsVisible:    true,   // [UX#5]
-  isScrollMode:      false,  // [UX#19]
-  readingSession: {
-    startTime:   Date.now(),
-    accumulated: 0,
-    positions:   new Set(),
-  },
-};
-
-const ReadingSettings = {
-  fontSize:   100,
-  lineHeight: 'normal',
-  theme:      'paper',
-  flow:       'paginated',
-};
-
-const LH_MAP = { narrow: '1.5', normal: '1.85', wide: '2.3' };
-const SETTINGS_KEY = 'fable_v2_settings';
+const LH_MAP   = { narrow: '1.5', normal: '1.85', wide: '2.3' };
+const STATE_KEY = 'fable_v3_state';
+const SYNC_TAG  = 'fable-annotation-sync';
+const DB_NAME   = 'FableV3DB';
+const DB_VER    = 3;
 
 /* ══════════════════════════════════════════════════════════
-   1. DOM 프록시 (캐시 + 타입 세이프)
+   §1. [R3] Error Boundary Manager
+   ══════════════════════════════════════════════════════════ */
+const ErrorBoundary = (() => {
+  const handlers = {};
+
+  function register(domain, handler) { handlers[domain] = handler; }
+
+  function handle(domain, err, context) {
+    const msg = `[Fable:${domain}]${context ? ' ' + context + ':' : ''} ${err?.message ?? err}`;
+    console.error(msg, err);
+    try { (handlers[domain] ?? handlers['global'])?.(err, context); } catch (_) {}
+  }
+
+  function wrap(domain, fn) {
+    return async (...args) => {
+      try { return await fn(...args); } catch (err) { handle(domain, err, fn.name); return null; }
+    };
+  }
+
+  return { register, handle, wrap };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   §2. [R2] Null-Safe DOMProxy (Null Object Pattern)
    ══════════════════════════════════════════════════════════ */
 const DOMProxy = (() => {
-  const cache = {};
-  return {
-    get(id) {
-      if (!cache[id]) cache[id] = document.getElementById(id);
-      return cache[id];
+  const cache = new Map();
+
+  const VOID_NODE = new Proxy(Object.create(null), {
+    get(_, prop) {
+      if (prop === 'style')     return new Proxy({}, { set() { return true; }, get() { return ''; } });
+      if (prop === 'classList') return { add(){}, remove(){}, toggle(){}, contains(){ return false; } };
+      if (prop === 'dataset')   return new Proxy({}, { set(){ return true; }, get(){ return ''; } });
+      const NO_OPS = ['addEventListener','removeEventListener','appendChild','querySelector',
+                      'querySelectorAll','focus','click','remove','setAttribute',
+                      'removeAttribute','dispatchEvent','contains'];
+      if (NO_OPS.includes(prop)) return () => VOID_NODE;
+      if (prop === 'textContent' || prop === 'innerHTML' || prop === 'value') return '';
+      if (prop === 'offsetHeight') return 0;
+      if (prop === 'disabled') return false;
+      return VOID_NODE;
     },
-    q(sel) { return document.querySelector(sel); },
-    qa(sel) { return Array.from(document.querySelectorAll(sel)); },
-    clear() { Object.keys(cache).forEach(k => delete cache[k]); },
+    set() { return true; },
+  });
+
+  return {
+    VOID_NODE,
+    get(id) {
+      if (!cache.has(id)) cache.set(id, document.getElementById(id) ?? VOID_NODE);
+      return cache.get(id);
+    },
+    exists(id) { return !!document.getElementById(id); },
+    q(sel)     { return document.querySelector(sel) ?? VOID_NODE; },
+    qa(sel)    { return Array.from(document.querySelectorAll(sel)); },
+    invalidate(id) { id ? cache.delete(id) : cache.clear(); },
   };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   2. [UX#8] 논블로킹 스택 토스트
+   §3. [R1] Proxy 기반 Reactive Store
+   ══════════════════════════════════════════════════════════ */
+const ReactiveStore = (() => {
+  const subscribers = new Map();
+  let   pendingKeys = new Set();
+  let   flushQueued = false;
+
+  function _flush() {
+    flushQueued = false;
+    const keys = [...pendingKeys];
+    pendingKeys.clear();
+    keys.forEach(key => {
+      (subscribers.get(key) ?? new Set()).forEach(fn => {
+        try { fn(store[key]); } catch (e) { ErrorBoundary.handle('global', e, 'store:' + key); }
+      });
+      (subscribers.get('*') ?? new Set()).forEach(fn => {
+        try { fn(key, store[key]); } catch (e) { ErrorBoundary.handle('global', e, 'store:*'); }
+      });
+    });
+  }
+
+  function _notify(key) {
+    pendingKeys.add(key);
+    if (!flushQueued) { flushQueued = true; requestAnimationFrame(_flush); }
+  }
+
+  const rawState = {
+    book: null, rendition: null, toc: [], currentHref: '',
+    totalLocations: 0, currentCFI: '', isTocOpen: false, isSettingsOpen: false,
+    bookKey: '', indexedDB: null, navBarsVisible: true, isScrollMode: false,
+    readingSession: { startTime: Date.now(), accumulated: 0, positions: new Set() },
+    fontSize: 100, lineHeight: 'normal', theme: 'paper', flow: 'paginated',
+    userBg: '#f4f1ea', userInk: '#1a1814', userSpacing: 0, userLeading: 1.85,
+  };
+
+  const store = new Proxy(rawState, {
+    set(target, key, value) {
+      if (target[key] === value) return true;
+      target[key] = value;
+      _notify(key);
+      return true;
+    },
+    get(target, key) { return target[key]; },
+  });
+
+  function subscribe(key, fn) {
+    if (!subscribers.has(key)) subscribers.set(key, new Set());
+    subscribers.get(key).add(fn);
+    return () => subscribers.get(key)?.delete(fn);
+  }
+
+  function patch(updates) { Object.entries(updates).forEach(([k, v]) => { store[k] = v; }); }
+
+  return { store, subscribe, patch };
+})();
+
+const store = ReactiveStore.store;
+
+/* ══════════════════════════════════════════════════════════
+   §4. [UX#8] 논블로킹 스택 토스트
    ══════════════════════════════════════════════════════════ */
 const Toast = (() => {
-  const DURATION   = 3000;
-  const FADE_OUT   = 280;
-  const MAX_STACK  = 4;
+  const DURATION = 3000, FADE_OUT = 280, MAX_STACK = 4;
   let queue = [];
 
   function show(message, type = 'info') {
     const container = DOMProxy.get('global-toast-container');
-    if (!container) return;
-
-    // 스택 초과 시 가장 오래된 토스트 즉시 퇴출
     if (queue.length >= MAX_STACK) {
       const oldest = queue.shift();
-      if (oldest && oldest.parentNode) {
-        oldest.classList.add('out');
-        setTimeout(() => oldest.remove(), FADE_OUT);
-      }
+      if (oldest?.parentNode) { oldest.classList.add('out'); setTimeout(() => oldest.remove(), FADE_OUT); }
     }
-
     const el = document.createElement('div');
     el.className = `toast${type !== 'info' ? ' ' + type : ''}`;
     el.textContent = message;
     container.appendChild(el);
     queue.push(el);
-
     setTimeout(() => {
       el.classList.add('out');
-      setTimeout(() => {
-        el.remove();
-        queue = queue.filter(t => t !== el);
-      }, FADE_OUT);
+      setTimeout(() => { el.remove(); queue = queue.filter(t => t !== el); }, FADE_OUT);
     }, DURATION);
   }
-
   return { show };
 })();
 
+/* Error Boundary 기본 핸들러 */
+ErrorBoundary.register('global',   (e) => Toast.show(`오류: ${e?.message ?? '알 수 없는 오류'}`, 'error'));
+ErrorBoundary.register('storage',  (e) => Toast.show(`저장소 오류: ${e?.message}`, 'error'));
+ErrorBoundary.register('renderer', (e) => Toast.show(`렌더링 오류: ${e?.message}`, 'error'));
+ErrorBoundary.register('network',  (e) => console.warn('[Network]', e?.message));
+
 /* ══════════════════════════════════════════════════════════
-   3. XSS 유틸
+   §5. XSS 유틸
    ══════════════════════════════════════════════════════════ */
 function setTextSafe(el, text) {
-  if (el) el.textContent = String(text ?? '');
+  if (el && el !== DOMProxy.VOID_NODE) el.textContent = String(text ?? '');
 }
 
 /* ══════════════════════════════════════════════════════════
-   4. StorageSystem (IndexedDB + localStorage LRU)
+   §6. StorageSystem (IndexedDB + localStorage LRU)
    ══════════════════════════════════════════════════════════ */
 const StorageSystem = {
-  DB_NAME: 'FableV2DB',
-  DB_VER:  2,
-
-  init() {
+  init: ErrorBoundary.wrap('storage', async function init() {
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(this.DB_NAME, this.DB_VER);
+      const req = indexedDB.open(DB_NAME, DB_VER);
       req.onupgradeneeded = (e) => {
         const db = e.target.result;
         if (!db.objectStoreNames.contains('books')) {
           db.createObjectStore('books', { keyPath: 'bookKey' });
         }
+        if (!db.objectStoreNames.contains('annotations')) {
+          const as = db.createObjectStore('annotations', { keyPath: 'uuid' });
+          as.createIndex('bookKey',     'bookKey',     { unique: false });
+          as.createIndex('pendingSync', 'pendingSync', { unique: false });
+        }
       };
-      req.onsuccess  = (e) => { ReaderState.indexedDB = e.target.result; resolve(); };
-      req.onerror    = () => reject(new Error('IndexedDB 초기화 실패'));
+      req.onsuccess = (e) => { store.indexedDB = e.target.result; resolve(); };
+      req.onerror   = () => reject(new Error('IndexedDB 초기화 실패'));
     });
-  },
+  }),
 
   async saveBook(bookKey, buffer, title, creator) {
     return new Promise((resolve, reject) => {
-      const tx    = ReaderState.indexedDB.transaction(['books'], 'readwrite');
-      const store = tx.objectStore('books');
-      store.put({ bookKey, bytes: buffer, title: title || '제목 없음', creator: creator || '', ts: Date.now() });
-      tx.oncomplete = () => resolve();
-      tx.onerror    = () => reject(tx.error);
+      const tx = store.indexedDB.transaction(['books'], 'readwrite');
+      tx.objectStore('books').put({ bookKey, bytes: buffer, title: title || '제목 없음', creator: creator || '', ts: Date.now() });
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
     });
   },
 
   async getAllBooks() {
     return new Promise(resolve => {
-      if (!ReaderState.indexedDB) return resolve([]);
-      const tx    = ReaderState.indexedDB.transaction(['books'], 'readonly');
-      const store = tx.objectStore('books');
-      const req   = store.getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror   = () => resolve([]);
+      if (!store.indexedDB) return resolve([]);
+      const tx = store.indexedDB.transaction(['books'], 'readonly');
+      const req = tx.objectStore('books').getAll();
+      req.onsuccess = () => resolve(req.result || []); req.onerror = () => resolve([]);
     });
   },
 
   async deleteBook(bookKey) {
     return new Promise(resolve => {
-      const tx    = ReaderState.indexedDB.transaction(['books'], 'readwrite');
-      const store = tx.objectStore('books');
-      store.delete(bookKey);
-      tx.oncomplete = () => resolve(true);
-      tx.onerror    = () => resolve(false);
+      const tx = store.indexedDB.transaction(['books'], 'readwrite');
+      tx.objectStore('books').delete(bookKey);
+      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
     });
   },
 
-  /* [UX#10] LRU 퇴거 알림 포함 localStorage 저장 */
+  async saveAnnotation(ann) {
+    return new Promise((resolve, reject) => {
+      const tx = store.indexedDB.transaction(['annotations'], 'readwrite');
+      tx.objectStore('annotations').put(ann);
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    });
+  },
+
+  async getAnnotationsByBook(bookKey) {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve([]);
+      const req = store.indexedDB.transaction(['annotations'], 'readonly')
+                      .objectStore('annotations').index('bookKey').getAll(bookKey);
+      req.onsuccess = () => resolve(req.result || []); req.onerror = () => resolve([]);
+    });
+  },
+
+  async getPendingAnnotations() {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve([]);
+      const req = store.indexedDB.transaction(['annotations'], 'readonly')
+                      .objectStore('annotations').index('pendingSync').getAll(1);
+      req.onsuccess = () => resolve(req.result || []); req.onerror = () => resolve([]);
+    });
+  },
+
+  async markAnnotationSynced(uuid) {
+    return new Promise(resolve => {
+      const tx = store.indexedDB.transaction(['annotations'], 'readwrite');
+      const s  = tx.objectStore('annotations');
+      const req = s.get(uuid);
+      req.onsuccess = () => {
+        if (req.result) { req.result.pendingSync = 0; s.put(req.result); }
+        resolve();
+      };
+      req.onerror = () => resolve();
+    });
+  },
+
   lsSet(key, value) {
     try {
       localStorage.setItem(key, JSON.stringify({ data: value, ts: Date.now() }));
@@ -191,11 +285,8 @@ const StorageSystem = {
   },
 
   lsGet(key, def = null) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return def;
-      return JSON.parse(raw).data ?? def;
-    } catch (_) { return def; }
+    try { const raw = localStorage.getItem(key); if (!raw) return def; return JSON.parse(raw).data ?? def; }
+    catch (_) { return def; }
   },
 
   _evictLRU() {
@@ -203,58 +294,146 @@ const StorageSystem = {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (!k?.startsWith('fable_')) continue;
-      try {
-        const { ts } = JSON.parse(localStorage.getItem(k));
-        entries.push({ k, ts });
-      } catch (_) {}
+      try { entries.push({ k, ts: JSON.parse(localStorage.getItem(k)).ts }); } catch (_) {}
     }
-    entries.sort((a, b) => a.ts - b.ts);
-    entries.slice(0, Math.ceil(entries.length * 0.3)).forEach(e => localStorage.removeItem(e.k));
+    entries.sort((a, b) => a.ts - b.ts)
+           .slice(0, Math.ceil(entries.length * 0.3))
+           .forEach(e => localStorage.removeItem(e.k));
   },
 };
 
 /* ══════════════════════════════════════════════════════════
-   5. [UX#4] 화면 크로스페이드 전환
+   §7. [UX#21] 충돌 해결 싱크 엔진 (UUID + LWW Merge)
+   ══════════════════════════════════════════════════════════ */
+const AnnotationSyncEngine = (() => {
+  function uuid() {
+    if (crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
+  async function create(bookKey, cfiRange, text, color = 'yellow', note = '') {
+    const ann = {
+      uuid: uuid(), bookKey, cfiRange, text: text.slice(0, 500), note, color,
+      device_timestamp: Date.now(), pendingSync: 1, synced_at: null,
+    };
+    await ErrorBoundary.wrap('storage', () => StorageSystem.saveAnnotation(ann))();
+    return ann;
+  }
+
+  async function updateNote(uuid_, note) {
+    const all = await StorageSystem.getAnnotationsByBook(store.bookKey);
+    const ann = all.find(a => a.uuid === uuid_);
+    if (!ann) return;
+    ann.note = note; ann.device_timestamp = Date.now(); ann.pendingSync = 1;
+    await ErrorBoundary.wrap('storage', () => StorageSystem.saveAnnotation(ann))();
+  }
+
+  /* Last-Write-Wins Merge: 동일 CFI에 두 항목이 충돌하면 device_timestamp 큰 쪽 우선 */
+  function mergeWithLWW(remoteItems, localItems) {
+    const merged = new Map();
+    remoteItems.forEach(r => merged.set(r.cfiRange, r));
+    localItems.forEach(l => {
+      const ex = merged.get(l.cfiRange);
+      if (!ex || l.device_timestamp > ex.device_timestamp) merged.set(l.cfiRange, l);
+    });
+    return [...merged.values()];
+  }
+
+  async function syncPending() {
+    const pending = await StorageSystem.getPendingAnnotations();
+    if (!pending.length) return;
+
+    if ('serviceWorker' in navigator && 'SyncManager' in window) {
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        await reg.sync.register(SYNC_TAG); return;
+      } catch (_) {}
+    }
+
+    if (navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage({ type: 'ANNOTATION_SYNC_REQUEST', payload: { items: pending } });
+      return;
+    }
+
+    /* 직접 fetch 스텁 */
+    try {
+      const res = await fetch('https://api.fable.example/annotations/sync', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ annotations: pending }),
+      });
+      if (res.ok) {
+        await Promise.all(pending.map(a => StorageSystem.markAnnotationSynced(a.uuid)));
+        Toast.show(`${pending.length}개 하이라이트가 동기화되었습니다.`, 'success');
+      }
+    } catch (err) { ErrorBoundary.handle('network', err, 'syncPending'); }
+  }
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', async (e) => {
+      if (e.data?.type === 'ANNOTATION_SYNC_RESULT' && e.data.result?.success) {
+        const pending = await StorageSystem.getPendingAnnotations();
+        await Promise.all(pending.map(a => StorageSystem.markAnnotationSynced(a.uuid)));
+        Toast.show(`${e.data.result.synced}개 하이라이트가 동기화되었습니다.`, 'success');
+      }
+      if (e.data?.type === 'SW_SYNC_TRIGGER') await syncPending();
+    });
+  }
+
+  return { create, updateNote, mergeWithLWW, syncPending };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   §8. [R2c] 자원 해제 파이프라인
+   ══════════════════════════════════════════════════════════ */
+const ResourceRegistry = (() => {
+  const listeners = [], storeSubs = [], timers = [], resizeObs = [];
+
+  function addListener(target, type, fn, opts) {
+    if (!target || target === DOMProxy.VOID_NODE) return;
+    target.addEventListener(type, fn, opts);
+    listeners.push({ target, type, fn, opts });
+  }
+  function addStoreSub(unsub) { storeSubs.push(unsub); }
+  function addTimer(id)       { timers.push(id); return id; }
+  function addResizeObserver(obs) { resizeObs.push(obs); }
+
+  function releaseAll() {
+    listeners.forEach(({ target, type, fn, opts }) => { try { target.removeEventListener(type, fn, opts); } catch (_) {} });
+    listeners.length = 0;
+    storeSubs.forEach(unsub => { try { unsub(); } catch (_) {} });
+    storeSubs.length = 0;
+    timers.forEach(id => { clearTimeout(id); clearInterval(id); });
+    timers.length = 0;
+    resizeObs.forEach(obs => { try { obs.disconnect(); } catch (_) {} });
+    resizeObs.length = 0;
+  }
+  return { addListener, addStoreSub, addTimer, addResizeObserver, releaseAll };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   §9. [UX#4] 화면 크로스페이드 전환
    ══════════════════════════════════════════════════════════ */
 function showViewerScreen() {
-  const up = DOMProxy.get('screen-uploader');
-  const vi = DOMProxy.get('screen-viewer');
-  if (!up || !vi) return;
-
+  const up = DOMProxy.get('screen-uploader'), vi = DOMProxy.get('screen-viewer');
   up.style.transition = 'opacity 300ms ease, transform 300ms ease';
-  up.style.opacity    = '0';
-  up.style.transform  = 'scale(0.97)';
-
+  up.style.opacity    = '0'; up.style.transform = 'scale(0.97)';
   setTimeout(() => {
-    up.style.display = 'none';
-    up.style.opacity = '';
-    up.style.transform = '';
-
-    vi.style.display  = 'flex';
-    vi.style.opacity  = '0';
-    vi.style.transform = 'scale(1.02)';
+    up.style.display = 'none'; up.style.opacity = ''; up.style.transform = '';
+    vi.style.display = 'flex'; vi.style.opacity = '0'; vi.style.transform = 'scale(1.02)';
     vi.style.transition = 'opacity 300ms ease, transform 300ms ease';
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      vi.style.opacity   = '1';
-      vi.style.transform = 'scale(1)';
-    }));
+    requestAnimationFrame(() => requestAnimationFrame(() => { vi.style.opacity = '1'; vi.style.transform = 'scale(1)'; }));
   }, 300);
 }
 
 function showUploaderScreen() {
-  const up = DOMProxy.get('screen-uploader');
-  const vi = DOMProxy.get('screen-viewer');
-  if (!up || !vi) return;
-
-  vi.style.transition = 'opacity 260ms ease';
-  vi.style.opacity    = '0';
+  const up = DOMProxy.get('screen-uploader'), vi = DOMProxy.get('screen-viewer');
+  vi.style.transition = 'opacity 260ms ease'; vi.style.opacity = '0';
   setTimeout(() => {
-    vi.style.display  = 'none';
-    vi.style.opacity  = '';
-    vi.style.transition = '';
-
-    up.style.display  = 'flex';
-    up.style.opacity  = '0';
+    vi.style.display = 'none'; vi.style.opacity = ''; vi.style.transition = '';
+    up.style.display = 'flex'; up.style.opacity = '0';
     up.style.transition = 'opacity 260ms ease';
     requestAnimationFrame(() => requestAnimationFrame(() => { up.style.opacity = '1'; }));
     setTimeout(() => { up.style.transition = ''; }, 300);
@@ -262,261 +441,208 @@ function showUploaderScreen() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   6. 로딩 오버레이
+   §10. 로딩 오버레이
    ══════════════════════════════════════════════════════════ */
 const LoadingOverlay = (() => {
   let el = null;
   function show(msg = '도서를 불러오는 중...') {
     if (el) return;
-    el = document.createElement('div');
-    el.className = 'loading-overlay';
-    el.innerHTML = `<div class="spinner"></div><p>${msg}</p>`;
+    el = document.createElement('div'); el.className = 'loading-overlay';
+    const p = document.createElement('p'); p.textContent = msg;
+    el.innerHTML = '<div class="spinner"></div>'; el.appendChild(p);
     const vi = DOMProxy.get('screen-viewer');
-    if (vi) vi.appendChild(el);
+    if (DOMProxy.exists('screen-viewer')) vi.appendChild(el);
   }
   function hide() {
     if (!el) return;
-    el.classList.add('fade-out');
-    setTimeout(() => { el?.remove(); el = null; }, 260);
+    el.classList.add('fade-out'); setTimeout(() => { el?.remove(); el = null; }, 260);
   }
   return { show, hide };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   7. [UX#20] 리사이즈 디바운스 뮤텍스 + 스피너 마스크
+   §11. [UX#20] 리사이즈 마스크
    ══════════════════════════════════════════════════════════ */
-const ResizeMask = (() => {
-  let maskEl = null;
-  function show() {
-    maskEl = DOMProxy.get('resize-mask');
-    if (maskEl) maskEl.style.display = 'flex';
-  }
-  function hide() {
-    if (maskEl) maskEl.style.display = 'none';
-  }
-  return { show, hide };
-})();
+const ResizeMask = {
+  show() { DOMProxy.get('resize-mask').style.display = 'flex'; },
+  hide() { DOMProxy.get('resize-mask').style.display = 'none'; },
+};
 
 /* ══════════════════════════════════════════════════════════
-   8. [UX#5] 상/하단 바 슬라이딩 토글
+   §12. [R1] Reactive UI Binders 마운트
    ══════════════════════════════════════════════════════════ */
-function toggleNavBars() {
-  const nav    = DOMProxy.get('viewer-nav-bar');
-  const bottom = DOMProxy.get('viewer-bottom-bar');
-  if (!nav || !bottom) return;
+function mountReactiveBinders() {
 
-  ReaderState.navBarsVisible = !ReaderState.navBarsVisible;
+  ReactiveStore.subscribe('theme', (theme) => {
+    if (theme === 'paper' || theme === 'custom') document.body.removeAttribute('data-theme');
+    else document.body.setAttribute('data-theme', theme);
 
-  if (ReaderState.navBarsVisible) {
-    nav.classList.remove('nav-hidden');
-    bottom.classList.remove('bottom-hidden');
-  } else {
-    nav.classList.add('nav-hidden');
-    bottom.classList.add('bottom-hidden');
-  }
+    if (store.rendition) {
+      requestAnimationFrame(() => {
+        try { store.rendition.themes.select(theme === 'custom' ? 'custom' : theme); }
+        catch (e) { ErrorBoundary.handle('renderer', e, 'theme:select'); }
+      });
+    }
+    DOMProxy.qa('.theme-swatch').forEach(b => {
+      const ok = b.dataset.theme === theme;
+      b.classList.toggle('active', ok); b.setAttribute('aria-checked', String(ok));
+    });
+    DOMProxy.get('custom-theme-builder').style.display = theme === 'custom' ? 'block' : 'none';
+  });
+
+  ReactiveStore.subscribe('fontSize', (size) => {
+    setTextSafe(DOMProxy.get('font-size-display'), `${size}%`);
+    if (store.rendition) requestAnimationFrame(() => {
+      try { store.rendition.themes.fontSize(`${size}%`); }
+      catch (e) { ErrorBoundary.handle('renderer', e, 'fontSize'); }
+    });
+  });
+
+  ReactiveStore.subscribe('lineHeight', (lh) => {
+    DOMProxy.qa('[data-lh]').forEach(b => {
+      const ok = b.dataset.lh === lh;
+      b.classList.toggle('active', ok); b.setAttribute('aria-checked', String(ok));
+    });
+    if (store.rendition) {
+      const val = LH_MAP[lh] || '1.85';
+      requestAnimationFrame(() => {
+        try { store.rendition.themes.override('line-height', val); }
+        catch (e) { ErrorBoundary.handle('renderer', e, 'lineHeight'); }
+      });
+    }
+  });
+
+  ReactiveStore.subscribe('flow', (flow) => {
+    DOMProxy.qa('[data-flow]').forEach(b => {
+      const ok = b.dataset.flow === flow;
+      b.classList.toggle('active', ok); b.setAttribute('aria-checked', String(ok));
+    });
+    DOMProxy.get('btn-scroll-top').style.display = flow === 'scrolled' ? 'flex' : 'none';
+  });
+
+  ReactiveStore.subscribe('navBarsVisible', (visible) => {
+    DOMProxy.get('viewer-nav-bar').classList.toggle('nav-hidden', !visible);
+    DOMProxy.get('viewer-bottom-bar').classList.toggle('bottom-hidden', !visible);
+  });
+
+  ReactiveStore.subscribe('isTocOpen', (open) => {
+    const sidebar = DOMProxy.get('toc-sidebar');
+    const overlay = DOMProxy.get('toc-overlay');
+    const btn     = DOMProxy.get('btn-toc-toggle');
+    if (open) {
+      sidebar.style.display = 'flex'; sidebar.offsetHeight;
+      sidebar.classList.add('open');
+      overlay.classList.add('visible', 'blur-backdrop');
+      btn.setAttribute('aria-expanded', 'true');
+    } else {
+      sidebar.classList.remove('open');
+      overlay.classList.remove('visible', 'blur-backdrop');
+      btn.setAttribute('aria-expanded', 'false');
+      setTimeout(() => { if (!store.isTocOpen) sidebar.style.display = 'none'; }, 240);
+    }
+  });
+
+  ReactiveStore.subscribe('isSettingsOpen', (open) => {
+    const panel = DOMProxy.get('settings-panel');
+    const btn   = DOMProxy.get('btn-settings-toggle');
+    if (open) {
+      panel.style.display = 'flex'; panel.offsetHeight;
+      panel.classList.add('open'); btn.classList.add('active');
+      btn.setAttribute('aria-expanded', 'true');
+    } else {
+      panel.classList.remove('open'); btn.classList.remove('active');
+      btn.setAttribute('aria-expanded', 'false');
+      setTimeout(() => { if (!store.isSettingsOpen) panel.style.display = 'none'; }, 240);
+    }
+  });
+
+  /* [UX#23] 커스텀 테마 CSS 변수 실시간 주입 */
+  ReactiveStore.subscribe('userBg',      (v) => { document.documentElement.style.setProperty('--color-user-bg', v);         _injectCustomToIframe(); });
+  ReactiveStore.subscribe('userInk',     (v) => { document.documentElement.style.setProperty('--color-user-ink', v);        _injectCustomToIframe(); });
+  ReactiveStore.subscribe('userSpacing', (v) => { document.documentElement.style.setProperty('--user-letter-spacing', v + 'em'); _injectCustomToIframe(); });
+  ReactiveStore.subscribe('userLeading', (v) => { document.documentElement.style.setProperty('--user-line-height', String(v)); _injectCustomToIframe(); });
+}
+
+function _injectCustomToIframe() {
+  if (!store.rendition || store.theme !== 'custom') return;
+  try {
+    store.rendition.themes.override('background-color', store.userBg);
+    store.rendition.themes.override('color',            store.userInk);
+    store.rendition.themes.override('letter-spacing',   store.userSpacing + 'em');
+    store.rendition.themes.override('line-height',      String(store.userLeading));
+  } catch (e) { ErrorBoundary.handle('renderer', e, 'customTheme'); }
 }
 
 /* ══════════════════════════════════════════════════════════
-   9. [UX#6] 진행률 즉각 연동
+   §13. [UX#6] 진행률 즉각 연동
    ══════════════════════════════════════════════════════════ */
 function updateProgressUI(location) {
   if (!location) return;
-
-  const fillEl  = DOMProxy.get('progress-bar-fill');
-  const textEl  = DOMProxy.get('viewer-progress-text');
-  const rangeEl = DOMProxy.get('reading-location-range');
-
   let pct = 0;
 
-  /* locations 연산 완료된 경우 */
-  if (ReaderState.totalLocations > 0 && ReaderState.book?.locations) {
+  if (store.totalLocations > 0 && store.book?.locations) {
     try {
-      const ratio = ReaderState.book.locations.percentageFromCfi(location.start.cfi);
+      const ratio = store.book.locations.percentageFromCfi(location.start.cfi);
       if (typeof ratio === 'number' && !isNaN(ratio)) pct = Math.round(ratio * 100);
     } catch (_) {}
   }
-
-  /* fallback: spine index 기준 상대 퍼센트 */
   if (pct === 0 && location.start.index >= 0) {
-    const spineLen = ReaderState.book?.spine?.items?.length || 1;
-    pct = Math.round((location.start.index / spineLen) * 100);
+    pct = Math.round((location.start.index / (store.book?.spine?.items?.length || 1)) * 100);
   }
-
   pct = Math.min(100, Math.max(0, pct));
-  if (fillEl) fillEl.style.width = `${pct}%`;
-  setTextSafe(textEl, `${pct}%`);
+
+  const fill = DOMProxy.get('progress-bar-fill');
+  fill.style.width = `${pct}%`;
+  DOMProxy.q('.progress-bar-track').setAttribute('aria-valuenow', pct);
+  setTextSafe(DOMProxy.get('viewer-progress-text'), `${pct}%`);
 
   const si = location.start.location >= 0 ? location.start.location + 1 : '-';
   const ei = location.end.location   >= 0 ? location.end.location   + 1 : '-';
-  const tt = ReaderState.totalLocations > 0 ? ReaderState.totalLocations : '-';
-  setTextSafe(rangeEl, `${si}–${ei} / ${tt}`);
+  const tt = store.totalLocations    >  0 ? store.totalLocations        : '-';
+  setTextSafe(DOMProxy.get('reading-location-range'), `${si}\u2013${ei} / ${tt}`);
 }
 
 /* ══════════════════════════════════════════════════════════
-   10. epub.js 렌더링 엔진
+   §14. epub.js 렌더링 엔진
    ══════════════════════════════════════════════════════════ */
 async function openEpubBook(fileData, isBuffer = false) {
   showViewerScreen();
   LoadingOverlay.show('도서 버퍼를 확장하는 중...');
+  await destroyCurrentRenditionContext();
 
-  if (ReaderState.rendition) await destroyEpubReader();
-
-  try {
-    /* 10-1. ePub 인스턴스 생성 + 타임아웃 가드 */
+  await ErrorBoundary.wrap('renderer', async () => {
     const book = await Promise.race([
-      new Promise((resolve, reject) => {
-        const b = ePub(fileData);
-        b.ready.then(() => resolve(b)).catch(reject);
-      }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('도서 디코딩 타임아웃 (15s)')), 15000)),
+      new Promise((res, rej) => { const b = ePub(fileData); b.ready.then(() => res(b)).catch(rej); }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('도서 디코딩 타임아웃 (15s)')), 15000)),
     ]);
-    ReaderState.book = book;
+    store.book = book;
 
-    /* 10-2. 메타 + 내비게이션 병렬 로드 */
-    const [meta, nav] = await Promise.all([
-      book.loaded.metadata,
-      book.loaded.navigation,
-    ]);
-
-    const title   = meta.title   || '제목 없음';
-    const creator = meta.creator || '';
+    const [meta, nav] = await Promise.all([book.loaded.metadata, book.loaded.navigation]);
+    const title = meta.title || '제목 없음', creator = meta.creator || '';
     setTextSafe(DOMProxy.get('nav-book-title'), title);
+    store.bookKey = 'fable_cfi_' + (title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50);
 
-    /* 10-3. bookKey 설정 */
-    ReaderState.bookKey = `fable_cfi_${(title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50)}`;
-
-    /* 10-4. 서재 저장 (파일 업로드 시) */
     if (!isBuffer && fileData instanceof File) {
-      const buffer = await fileData.arrayBuffer();
-      await StorageSystem.saveBook(ReaderState.bookKey, buffer, title, creator);
+      const buf = await fileData.arrayBuffer();
+      await StorageSystem.saveBook(store.bookKey, buf, title, creator);
       renderLibraryGrid();
     }
 
-    /* 10-5. TOC 렌더링 */
     renderTocSidebar(nav.toc || []);
-
-    /* 10-6. Rendition 생성 */
-    initRenditionEngine();
-
-    /* 10-7. [UX#3] locations 백그라운드 생성 */
+    initRenditionEngine(book);
     generateLocationsBackground(book);
-
-    /* 10-8. 읽기 세션 통계 시작 */
     ReadingStatsTracker.startSession();
 
-  } catch (err) {
-    LoadingOverlay.hide();
-    Toast.show(`책을 열 수 없습니다: ${err.message}`, 'error');
-    exitViewer();
-  }
+    const annotations = await StorageSystem.getAnnotationsByBook(store.bookKey);
+    AnnotationManager.restoreAll(annotations);
+  })();
+
+  if (!store.rendition) { LoadingOverlay.hide(); exitViewer(); }
 }
 
-/* ── locations 백그라운드 워커 팔백 (Dead Code 연결) ── */
-function generateLocationsBackground(book) {
-  /* Web Worker 지원 시 오프로드 */
-  if (typeof Worker !== 'undefined') {
-    const workerCode = `
-      self.onmessage = function(e) {
-        var len = e.data.spineLength || 10;
-        var list = [];
-        for (var i = 0; i < len; i++) {
-          list.push("epubcfi(/6/" + (i * 2 + 2) + "[s" + i + "]!/4/2)");
-        }
-        self.postMessage({ list: list });
-      };
-    `;
-    const blob      = new Blob([workerCode], { type: 'application/javascript' });
-    const workerURL = URL.createObjectURL(blob);
-    const worker    = new Worker(workerURL);
-    worker.postMessage({ spineLength: book.spine?.items?.length || 10 });
-    worker.onmessage = (e) => {
-      ReaderState.totalLocations = e.data.list.length;
-      URL.revokeObjectURL(workerURL);
-      worker.terminate();
-    };
-    worker.onerror = () => { URL.revokeObjectURL(workerURL); worker.terminate(); };
-  }
-
-  /* epub.js 자체 locations도 병렬 생성 */
-  book.locations.generate(1600)
-    .then(locs => { ReaderState.totalLocations = Math.max(ReaderState.totalLocations, locs.length); })
-    .catch(() => {});
-}
-
-/* ── Rendition 초기화 ─────────────────────────────────────── */
-function initRenditionEngine() {
-  const viewport = DOMProxy.get('viewer-viewport');
-  if (!viewport) return;
-
-  ReaderState.rendition = ReaderState.book.renderTo(viewport, {
-    manager: 'continuous',
-    flow:    ReadingSettings.flow,
-    width:   '100%',
-    height:  '100%',
-    spread:  'auto',
-  });
-
-  /* 테마 3종 등록 */
-  registerEpubThemes(ReaderState.rendition);
-
-  /* 스타일 주입 훅 */
-  ReaderState.rendition.hooks.content.register(injectContentStyles);
-
-  applyAllSettings();
-
-  const savedCFI = StorageSystem.lsGet(`fable_cfi_${ReaderState.bookKey}`, '');
-
-  ReaderState.rendition.display(savedCFI || undefined).then(() => {
-    LoadingOverlay.hide();
-    if (savedCFI) Toast.show('이전에 읽던 위치에서 시작합니다.', 'success');
-    SearchEngine.build(ReaderState.book);
-    initAnnotationManager(ReaderState.rendition);
-  }).catch((err) => {
-    LoadingOverlay.hide();
-    Toast.show(`렌더링 오류: ${err.message}`, 'error');
-  });
-
-  /* ── relocated 이벤트 ── */
-  ReaderState.rendition.on('relocated', (location) => {
-    ReaderState.currentCFI = location.start.cfi;
-    StorageSystem.lsSet(`fable_cfi_${ReaderState.bookKey}`, location.start.cfi);
-    ReadingStatsTracker.markPosition(location.start.cfi);
-    updateProgressUI(location);
-
-    const href = location.start.href;
-    if (href && href !== ReaderState.currentHref) {
-      ReaderState.currentHref = href;
-      updateTocActiveItem(href);
-    }
-    updateArrowState(location);
-    NavGuard.onRelocated();
-  });
-
-  /* iframe keyup → 키보드 네비게이션 */
-  ReaderState.rendition.on('keyup', handleKeyDown);
-
-  /* [UX#5] iframe 클릭 → 바 토글 */
-  ReaderState.rendition.on('click', () => {
-    if (ReaderState.isTocOpen)     closeTocSidebar();
-    if (ReaderState.isSettingsOpen) closeSettingsPanel();
-    toggleNavBars();
-  });
-
-  /* [UX#19] 스크롤 모드 스크롤 이벤트 */
-  ReaderState.rendition.on('rendered', (section, view) => {
-    if (ReadingSettings.flow === 'scrolled') {
-      bindScrollTopButton(view);
-    }
-  });
-}
-
-/* ── epub.js 테마 3종 등록 ──────────────────────────────────── */
+/* ── 테마 등록 ── */
 function registerEpubThemes(rendition) {
-  const BASE = {
-    'font-family':   "'Gowun Batang', 'Noto Serif KR', Georgia, serif",
-    'word-break':    'keep-all',
-    'overflow-wrap': 'break-word',
-  };
+  const BASE = { 'font-family': "'Gowun Batang','Noto Serif KR',Georgia,serif", 'word-break': 'keep-all', 'overflow-wrap': 'break-word' };
 
   rendition.themes.register('paper', {
     body: { ...BASE, background: '#fcfbf7 !important', color: '#1a1814 !important' },
@@ -524,8 +650,6 @@ function registerEpubThemes(rendition) {
     'h1,h2,h3,h4': { 'font-weight': '700', 'line-height': '1.4' },
     img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
-
-  /* [UX#7] 다크: 대비 0.92, font-weight 300 조정 */
   rendition.themes.register('dark', {
     body: { ...BASE, background: '#1a1a1e !important', color: '#c8c6c0 !important', filter: 'contrast(0.92)', 'font-weight': '300' },
     'p,li,blockquote': { 'margin-bottom': '0.6em' },
@@ -533,413 +657,386 @@ function registerEpubThemes(rendition) {
     a: { color: '#8a8882 !important' },
     img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
-
   rendition.themes.register('white', {
     body: { ...BASE, background: '#ffffff !important', color: '#111111 !important' },
     'p,li,blockquote': { 'margin-bottom': '0.6em' },
     'h1,h2,h3,h4': { 'font-weight': '700', 'line-height': '1.4' },
     img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
+  rendition.themes.register('custom', {
+    body: { ...BASE, background: store.userBg + ' !important', color: store.userInk + ' !important',
+            'letter-spacing': store.userSpacing + 'em', 'line-height': String(store.userLeading) },
+    img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
+  });
 }
 
-/* ── iframe 공통 스타일 강제 주입 ─────────────────────────── */
+/* [R2b] FOUC 방지 콘텐츠 스타일 즉시 주입 */
 function injectContentStyles(contents) {
   const doc = contents.document;
   if (!doc) return;
+  doc.getElementById('fable-injected')?.remove();
   const style = doc.createElement('style');
   style.id = 'fable-injected';
+  const themeBg = store.theme === 'dark' ? '#1a1a1e' : store.theme === 'white' ? '#ffffff' : store.theme === 'custom' ? store.userBg : '#fcfbf7';
   style.textContent = `
-    *, *::before, *::after { box-sizing: border-box; }
-    p, div, span, li, td { page-break-inside: avoid; break-inside: avoid; }
-    body { -webkit-font-smoothing: antialiased; }
-    mark.fable-search-mark {
-      background: rgba(255,220,50,0.55);
-      border-radius: 2px;
-      animation: fable-mark-pulse 1.2s ease-out forwards;
-    }
-    @keyframes fable-mark-pulse {
-      0%   { background: rgba(255,165,0,0.75); }
-      100% { background: rgba(255,220,50,0.45); }
-    }
+    html,body { background:${themeBg} !important; -webkit-font-smoothing:antialiased; }
+    *,*::before,*::after { box-sizing:border-box; }
+    p,div,span,li,td { page-break-inside:avoid; break-inside:avoid; }
+    mark.fable-search-mark { background:rgba(255,220,50,0.55); border-radius:2px; animation:fable-mark-pulse 1.2s ease-out forwards; }
+    @keyframes fable-mark-pulse { 0% { background:rgba(255,165,0,0.75); } 100% { background:rgba(255,220,50,0.45); } }
+    .hl-yellow { background:rgba(255,235,59,0.45)!important; border-bottom:2px solid #f5c800!important; }
+    .hl-green  { background:rgba(105,240,174,0.40)!important; border-bottom:2px solid #00c853!important; }
+    .fable-search-hl { background:rgba(255,165,0,0.45)!important; border-radius:3px; }
   `;
   doc.head.appendChild(style);
 }
 
-/* ── 모든 설정 적용 ──────────────────────────────────────────*/
-function applyAllSettings() {
-  if (!ReaderState.rendition) return;
-  requestAnimationFrame(() => {
-    ReaderState.rendition.themes.select(ReadingSettings.theme);
-    ReaderState.rendition.themes.fontSize(`${ReadingSettings.fontSize}%`);
-    const lh = LH_MAP[ReadingSettings.lineHeight] || '1.85';
-    ReaderState.rendition.themes.override('line-height', lh);
+function initRenditionEngine(book) {
+  const viewport = DOMProxy.get('viewer-viewport');
+  if (!DOMProxy.exists('viewer-viewport')) return;
 
-    /* shell 테마 */
-    if (ReadingSettings.theme === 'paper') {
-      document.body.removeAttribute('data-theme');
-    } else {
-      document.body.setAttribute('data-theme', ReadingSettings.theme);
-    }
+  const rendition = book.renderTo(viewport, {
+    manager: 'continuous', flow: store.flow, width: '100%', height: '100%', spread: 'auto',
+  });
+  store.rendition = rendition;
 
-    /* 설정 UI 동기화 */
-    syncSettingsUI();
+  registerEpubThemes(rendition);
+  rendition.hooks.content.register(injectContentStyles); /* [R2b] */
+  _applyAllRenditionSettings(rendition);
+
+  const savedCFI = StorageSystem.lsGet('fable_cfi_' + store.bookKey, '');
+  rendition.display(savedCFI || undefined)
+    .then(() => {
+      LoadingOverlay.hide();
+      if (savedCFI) Toast.show('이전에 읽던 위치에서 시작합니다.', 'success');
+      SearchEngine.build(book);
+      initAnnotationManager(rendition);
+      NavGuard.init(rendition);
+    })
+    .catch(err => { LoadingOverlay.hide(); ErrorBoundary.handle('renderer', err, 'rendition.display'); });
+
+  rendition.on('relocated', (location) => {
+    store.currentCFI = location.start.cfi;
+    StorageSystem.lsSet('fable_cfi_' + store.bookKey, location.start.cfi);
+    ReadingStatsTracker.markPosition(location.start.cfi);
+    updateProgressUI(location);
+    const href = location.start.href;
+    if (href && href !== store.currentHref) { store.currentHref = href; updateTocActiveItem(href); }
+    _updateArrowState(location);
+    NavGuard.onRelocated();
+  });
+
+  rendition.on('keyup', handleKeyDown);
+  rendition.on('click', () => {
+    if (store.isTocOpen)      store.isTocOpen     = false;
+    if (store.isSettingsOpen) store.isSettingsOpen = false;
+    store.navBarsVisible = !store.navBarsVisible;
+  });
+  rendition.on('rendered', (section, view) => {
+    if (view?.document) injectContentStyles({ document: view.document }); /* [R2b] 재확인 */
+    if (store.flow === 'scrolled') bindScrollTopButton(view);
   });
 }
 
-function syncSettingsUI() {
-  setTextSafe(DOMProxy.get('font-size-display'), `${ReadingSettings.fontSize}%`);
-  DOMProxy.qa('[data-lh]').forEach(b => b.classList.toggle('active', b.dataset.lh === ReadingSettings.lineHeight));
-  DOMProxy.qa('.theme-swatch').forEach(b => b.classList.toggle('active', b.dataset.theme === ReadingSettings.theme));
-  DOMProxy.qa('[data-flow]').forEach(b => b.classList.toggle('active', b.dataset.flow === ReadingSettings.flow));
+function _applyAllRenditionSettings(rendition) {
+  const t = store.theme === 'custom' ? 'custom' : store.theme;
+  try { rendition.themes.select(t); } catch (_) {}
+  try { rendition.themes.fontSize(`${store.fontSize}%`); } catch (_) {}
+  try { rendition.themes.override('line-height', LH_MAP[store.lineHeight] || '1.85'); } catch (_) {}
+  if (store.theme === 'custom') _injectCustomToIframe();
 }
 
-/* ── 화살표 상태 ─────────────────────────────────────────── */
-function updateArrowState(location) {
-  const p = DOMProxy.get('arrow-prev');
-  const n = DOMProxy.get('arrow-next');
-  if (p) p.disabled = location.atStart === true;
-  if (n) n.disabled = location.atEnd   === true;
+function _updateArrowState(location) {
+  DOMProxy.get('arrow-prev').disabled = location.atStart === true;
+  DOMProxy.get('arrow-next').disabled = location.atEnd   === true;
 }
 
-/* ── epub.js 인스턴스 완전 정리 ──────────────────────────── */
-async function destroyEpubReader() {
+/* ══════════════════════════════════════════════════════════
+   §15. [R2c] destroyCurrentRenditionContext — 자원 해제 파이프라인
+   ══════════════════════════════════════════════════════════ */
+async function destroyCurrentRenditionContext() {
   ReadingStatsTracker.stopSession();
   NavGuard.destroy();
   SearchEngine.destroy();
+  AnnotationManager.reset();
+  VirtualSearchList.destroy();
+  ResourceRegistry.releaseAll(); /* [R2c] 모든 이벤트 리스너 일괄 해제 */
 
   const vp = DOMProxy.get('viewer-viewport');
-  if (vp) {
+  if (DOMProxy.exists('viewer-viewport')) {
     vp.querySelectorAll('iframe').forEach(f => { f.src = 'about:blank'; f.remove(); });
   }
 
-  if (ReaderState.rendition) {
-    try { ReaderState.rendition.destroy(); } catch (_) {}
-    ReaderState.rendition = null;
-  }
-  if (ReaderState.book) {
-    try { ReaderState.book.destroy(); } catch (_) {}
-    ReaderState.book = null;
-  }
+  if (store.rendition) { try { store.rendition.destroy(); } catch (_) {} store.rendition = null; }
+  if (store.book)      { try { store.book.destroy();      } catch (_) {} store.book      = null; }
 
-  Object.assign(ReaderState, {
-    toc: [], currentHref: '', totalLocations: 0,
-    currentCFI: '', isTocOpen: false, isSettingsOpen: false,
-    bookKey: '', navBarsVisible: true, isScrollMode: false,
+  ReactiveStore.patch({
+    toc: [], currentHref: '', totalLocations: 0, currentCFI: '',
+    isTocOpen: false, isSettingsOpen: false, bookKey: '',
+    navBarsVisible: true, isScrollMode: false,
   });
+  DOMProxy.invalidate();
 
   setTextSafe(DOMProxy.get('nav-book-title'),        '도서 로딩 중...');
   setTextSafe(DOMProxy.get('viewer-progress-text'),  '0%');
   setTextSafe(DOMProxy.get('reading-location-range'), '- / -');
-  const fill = DOMProxy.get('progress-bar-fill');
-  if (fill) fill.style.width = '0%';
-  const tocList = DOMProxy.get('toc-list');
-  if (tocList) tocList.innerHTML = '';
+  DOMProxy.get('progress-bar-fill').style.width = '0%';
+  if (DOMProxy.exists('toc-list')) DOMProxy.get('toc-list').innerHTML = '';
 }
 
 function exitViewer() {
-  destroyEpubReader().then(() => {
-    showUploaderScreen();
-    renderLibraryGrid();
-  });
+  destroyCurrentRenditionContext().then(() => { showUploaderScreen(); renderLibraryGrid(); });
 }
 
 /* ══════════════════════════════════════════════════════════
-   11. [UX#3] 가로↔세로 전환 CFI 보정 스케줄러
+   §16. [UX#3] 가로↔세로 CFI 보정 스케줄러
    ══════════════════════════════════════════════════════════ */
 function switchFlowMode(mode) {
-  if (ReadingSettings.flow === mode || !ReaderState.book) return;
-
-  const savedCFI = ReaderState.currentCFI;
-  ReadingSettings.flow = mode;
-  ReaderState.isScrollMode = mode === 'scrolled';
-
-  const scrollTopBtn = DOMProxy.get('btn-scroll-top');
-  if (scrollTopBtn) scrollTopBtn.style.display = mode === 'scrolled' ? 'flex' : 'none';
-
-  destroyEpubReader().then(() => {
-    initRenditionEngine();
-    /* 300ms 지연 보정: 렌더러 안정화 후 CFI 복원 */
-    if (savedCFI) {
-      setTimeout(() => {
-        ReaderState.rendition?.display(savedCFI).catch(() => {});
-      }, 350);
-    }
+  if (store.flow === mode || !store.book) return;
+  const savedCFI = store.currentCFI;
+  const savedBook = store.book;
+  store.flow = mode;
+  destroyCurrentRenditionContext().then(() => {
+    store.book = savedBook;
+    initRenditionEngine(savedBook);
+    if (savedCFI) ResourceRegistry.addTimer(setTimeout(() => { store.rendition?.display(savedCFI).catch(() => {}); }, 350));
   });
 }
 
 /* ══════════════════════════════════════════════════════════
-   12. 네비게이션 뮤텍스 (NavGuard)
+   §17. NavGuard (뮤텍스 + 리사이즈 + 터치 스와이프)
    ══════════════════════════════════════════════════════════ */
 const NavGuard = (() => {
-  let navigating     = false;
-  let pending        = null;
-  let resizeObs      = null;
-  let resizeTimer    = null;
-  let gestureAxis    = null;
-  let touchStartX    = 0;
-  let touchStartY    = 0;
-  let touchStartTime = 0;
-  let cfiSnapshot    = '';
+  let navigating = false, pending = null, resizeObs = null, resizeTimer = null;
+  let gestureAxis = null, touchStartX = 0, touchStartY = 0, touchStartTime = 0, cfiSnap = '';
 
-  function acquire() {
-    if (navigating) return false;
-    navigating = true;
-    _disableArrows(true);
-    return true;
-  }
-
+  function acquire() { if (navigating) return false; navigating = true; _setArrows(false); return true; }
   function release() {
-    navigating = false;
-    _disableArrows(false);
-    if (pending) {
-      const d = pending; pending = null;
-      requestAnimationFrame(() => d === 'prev' ? prev() : next());
-    }
+    navigating = false; _setArrows(true);
+    if (pending) { const d = pending; pending = null; requestAnimationFrame(() => d === 'prev' ? prev() : next()); }
   }
-
   function onRelocated() { release(); }
-
-  function _disableArrows(off) {
-    const p = DOMProxy.get('arrow-prev');
-    const n = DOMProxy.get('arrow-next');
-    if (p) p.style.pointerEvents = off ? 'none' : '';
-    if (n) n.style.pointerEvents = off ? 'none' : '';
+  function _setArrows(en) {
+    DOMProxy.get('arrow-prev').style.pointerEvents = en ? '' : 'none';
+    DOMProxy.get('arrow-next').style.pointerEvents = en ? '' : 'none';
   }
 
   async function prev() {
-    if (!ReaderState.rendition) return;
+    if (!store.rendition) return;
     if (!acquire()) { pending = 'prev'; return; }
-    try { await ReaderState.rendition.prev(); } catch (_) { release(); }
+    try { await store.rendition.prev(); } catch (_) { release(); }
   }
-
   async function next() {
-    if (!ReaderState.rendition) return;
+    if (!store.rendition) return;
     if (!acquire()) { pending = 'next'; return; }
-    try { await ReaderState.rendition.next(); } catch (_) { release(); }
+    try { await store.rendition.next(); } catch (_) { release(); }
   }
 
-  /* [UX#20] ResizeObserver + 디바운스 + 스피너 마스크 */
-  function initResize(rendition) {
+  function _initResize(rendition) {
     const vp = DOMProxy.get('viewer-viewport');
-    if (!vp || typeof ResizeObserver === 'undefined') return;
-
+    if (!DOMProxy.exists('viewer-viewport') || typeof ResizeObserver === 'undefined') return;
     resizeObs = new ResizeObserver(entries => {
-      if (!ReaderState.rendition) return;
-      if (ReaderState.currentCFI) cfiSnapshot = ReaderState.currentCFI;
-
+      if (!store.rendition) return;
+      if (store.currentCFI) cfiSnap = store.currentCFI;
       ResizeMask.show();
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(async () => {
-        if (!ReaderState.rendition) { ResizeMask.hide(); return; }
+        if (!store.rendition) { ResizeMask.hide(); return; }
         const { width, height } = entries[entries.length - 1].contentRect;
         if (width < 2 || height < 2) { ResizeMask.hide(); return; }
-
         try {
           navigating = false; pending = null;
           rendition.resize(width, height);
           await new Promise(r => requestAnimationFrame(r));
-          if (cfiSnapshot) await rendition.display(cfiSnapshot).catch(() => {});
+          if (cfiSnap) await rendition.display(cfiSnap).catch(() => {});
         } catch (_) {}
         ResizeMask.hide();
       }, 160);
     });
     resizeObs.observe(vp);
+    ResourceRegistry.addResizeObserver(resizeObs);
   }
 
-  /* [UX#9] 터치 스와이프 엣지 가드 */
-  function initTouch() {
+  function _initTouch() {
     const viewer = DOMProxy.get('screen-viewer');
-    if (!viewer) return;
-    const SWIPE_MIN = 50;
-    const AXIS_LOCK = 8;
-    const EDGE_PX   = window.innerWidth * 0.1; // 화면 10% 엣지 보호
+    if (!DOMProxy.exists('screen-viewer')) return;
+    const SWIPE_MIN = 50, AXIS_LOCK = 8, EDGE_PX = window.innerWidth * 0.1;
 
-    viewer.addEventListener('touchstart', (e) => {
-      const panel = DOMProxy.get('settings-panel');
-      const toc   = DOMProxy.get('toc-sidebar');
-      if (panel?.contains(e.target) || toc?.contains(e.target)) return;
-      touchStartX    = e.touches[0].clientX;
-      touchStartY    = e.touches[0].clientY;
-      touchStartTime = Date.now();
-      gestureAxis    = null;
-    }, { passive: true });
-
-    viewer.addEventListener('touchmove', (e) => {
+    const onStart = (e) => {
+      const panel = DOMProxy.get('settings-panel'), toc = DOMProxy.get('toc-sidebar');
+      if (panel.contains?.(e.target) || toc.contains?.(e.target)) return;
+      touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY;
+      touchStartTime = Date.now(); gestureAxis = null;
+    };
+    const onMove = (e) => {
       if (gestureAxis === 'y') return;
-      const dx = Math.abs(e.touches[0].clientX - touchStartX);
-      const dy = Math.abs(e.touches[0].clientY - touchStartY);
-      if (gestureAxis === null && (dx > AXIS_LOCK || dy > AXIS_LOCK)) {
-        gestureAxis = dx >= dy ? 'x' : 'y';
-      }
+      const dx = Math.abs(e.touches[0].clientX - touchStartX), dy = Math.abs(e.touches[0].clientY - touchStartY);
+      if (gestureAxis === null && (dx > AXIS_LOCK || dy > AXIS_LOCK)) gestureAxis = dx >= dy ? 'x' : 'y';
       if (gestureAxis === 'x') e.preventDefault();
-    }, { passive: false });
-
-    viewer.addEventListener('touchend', (e) => {
+    };
+    const onEnd = (e) => {
       if (gestureAxis !== 'x') return;
-      if (Date.now() - touchStartTime > 500) return; // 롱프레스 제외
-
+      if (Date.now() - touchStartTime > 500) return;
       const deltaX = e.changedTouches[0].clientX - touchStartX;
       if (Math.abs(deltaX) < SWIPE_MIN) return;
-
-      /* [UX#9] 엣지 보호: 좌우 10% 내 시작 터치는 무시 */
-      if (touchStartX < EDGE_PX || touchStartX > window.innerWidth - EDGE_PX) {
-        gestureAxis = null;
-        return;
-      }
-
-      deltaX < 0 ? next() : prev();
-      gestureAxis = null;
-    }, { passive: true });
+      if (touchStartX < EDGE_PX || touchStartX > window.innerWidth - EDGE_PX) { gestureAxis = null; return; }
+      deltaX < 0 ? next() : prev(); gestureAxis = null;
+    };
+    ResourceRegistry.addListener(viewer, 'touchstart', onStart, { passive: true });
+    ResourceRegistry.addListener(viewer, 'touchmove',  onMove,  { passive: false });
+    ResourceRegistry.addListener(viewer, 'touchend',   onEnd,   { passive: true });
   }
 
-  function init(rendition) {
-    navigating = false; pending = null; gestureAxis = null;
-    initResize(rendition);
-    initTouch();
-  }
-
-  function destroy() {
-    if (resizeObs) { resizeObs.disconnect(); resizeObs = null; }
-    clearTimeout(resizeTimer);
-    navigating = false; pending = null;
-  }
+  function init(rendition) { navigating = false; pending = null; gestureAxis = null; _initResize(rendition); _initTouch(); }
+  function destroy() { if (resizeObs) { resizeObs.disconnect(); resizeObs = null; } clearTimeout(resizeTimer); navigating = false; pending = null; }
 
   return { init, destroy, prev, next, onRelocated };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   13. TOC 사이드바 (블러 오버레이 포함 [UX#16])
+   §18. locations 백그라운드 생성
+   ══════════════════════════════════════════════════════════ */
+function generateLocationsBackground(book) {
+  if (typeof Worker !== 'undefined') {
+    const code = `self.onmessage=function(e){var l=e.data.spineLength||10,list=[];for(var i=0;i<l;i++)list.push("epubcfi(/6/"+(i*2+2)+"[s"+i+"]!/4/2)");self.postMessage({list:list});};`;
+    const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+    const w   = new Worker(url);
+    w.postMessage({ spineLength: book.spine?.items?.length || 10 });
+    w.onmessage = (e) => { store.totalLocations = e.data.list.length; URL.revokeObjectURL(url); w.terminate(); };
+    w.onerror   = () => { URL.revokeObjectURL(url); w.terminate(); };
+  }
+  book.locations.generate(1600).then(l => { store.totalLocations = Math.max(store.totalLocations, l.length); }).catch(() => {});
+}
+
+/* ══════════════════════════════════════════════════════════
+   §19. TOC 사이드바
    ══════════════════════════════════════════════════════════ */
 function renderTocSidebar(tocData) {
   const container = DOMProxy.get('toc-list');
-  if (!container) return;
+  if (!DOMProxy.exists('toc-list')) return;
   container.innerHTML = '';
 
-  if (!tocData || tocData.length === 0) {
+  if (!tocData?.length) {
     const p = document.createElement('p');
     p.style.cssText = 'padding:20px;color:var(--color-ink-muted);font-size:13px;text-align:center;';
-    p.textContent = '목차 정보가 없습니다.';
-    container.appendChild(p);
-    return;
+    p.textContent = '목차 정보가 없습니다.'; container.appendChild(p); return;
   }
-
   const frag = document.createDocumentFragment();
   function appendItems(items, depth) {
     items.forEach(item => {
       const btn = document.createElement('button');
-      btn.className = 'toc-item';
-      btn.dataset.depth = String(Math.min(depth, 3));
-      btn.dataset.href  = item.href || '';
-      btn.textContent   = item.label?.trim() || '(제목 없음)';
+      btn.className     = 'toc-item'; btn.dataset.depth = String(Math.min(depth, 3));
+      btn.dataset.href  = item.href || ''; btn.textContent = item.label?.trim() || '(제목 없음)';
+      btn.setAttribute('role', 'listitem');
       btn.addEventListener('click', () => {
-        if (ReaderState.rendition && item.href) {
-          ReaderState.rendition.display(item.href).catch(() => {});
-        }
-        closeTocSidebar();
+        if (store.rendition && item.href) store.rendition.display(item.href).catch(() => {});
+        store.isTocOpen = false;
       });
       frag.appendChild(btn);
       if (item.subitems?.length) appendItems(item.subitems, depth + 1);
     });
   }
-  appendItems(tocData, 1);
-  container.appendChild(frag);
-}
-
-function openTocSidebar() {
-  if (ReaderState.isSettingsOpen) closeSettingsPanel();
-  const sidebar  = DOMProxy.get('toc-sidebar');
-  const overlay  = DOMProxy.get('toc-overlay');
-  if (!sidebar) return;
-
-  sidebar.style.display = 'flex';
-  sidebar.offsetHeight;
-  sidebar.classList.add('open');
-
-  /* [UX#16] 블러 오버레이 */
-  if (overlay) { overlay.classList.add('visible'); overlay.classList.add('blur-backdrop'); }
-  ReaderState.isTocOpen = true;
-}
-
-function closeTocSidebar() {
-  const sidebar = DOMProxy.get('toc-sidebar');
-  const overlay = DOMProxy.get('toc-overlay');
-  if (sidebar) {
-    sidebar.classList.remove('open');
-    setTimeout(() => { if (!ReaderState.isTocOpen) sidebar.style.display = 'none'; }, 240);
-  }
-  if (overlay) { overlay.classList.remove('visible'); overlay.classList.remove('blur-backdrop'); }
-  ReaderState.isTocOpen = false;
+  appendItems(tocData, 1); container.appendChild(frag);
 }
 
 function updateTocActiveItem(href) {
-  DOMProxy.get('toc-list')?.querySelectorAll('.toc-item').forEach(item => {
+  DOMProxy.get('toc-list').querySelectorAll?.('.toc-item').forEach(item => {
     const ih = item.dataset.href || '';
-    const match = ih && (href.includes(ih.split('#')[0]) || ih.includes(href.split('#')[0]));
-    item.classList.toggle('active', match);
+    item.classList.toggle('active', !!(ih && (href.includes(ih.split('#')[0]) || ih.includes(href.split('#')[0]))));
   });
 }
 
 /* ══════════════════════════════════════════════════════════
-   14. 설정 패널
+   §20. [UX#22] 가상 스크롤 검색 레이어 (IntersectionObserver 재활용 풀)
    ══════════════════════════════════════════════════════════ */
-function openSettingsPanel() {
-  if (ReaderState.isTocOpen) closeTocSidebar();
-  const panel = DOMProxy.get('settings-panel');
-  if (!panel) return;
-  panel.style.display = 'flex';
-  panel.offsetHeight;
-  panel.classList.add('open');
-  DOMProxy.get('btn-settings-toggle')?.classList.add('active');
-  ReaderState.isSettingsOpen = true;
-}
+const VirtualSearchList = (() => {
+  const VISIBLE = 20, ITEM_H = 64;
+  let allResults = [], renderedStart = 0, container = null, sentinel = null, observer = null, pool = [], _q = '';
 
-function closeSettingsPanel(immediate = false) {
-  const panel = DOMProxy.get('settings-panel');
-  if (!panel) return;
-  panel.classList.remove('open');
-  if (immediate) {
-    panel.style.display = 'none';
-  } else {
-    setTimeout(() => { if (!ReaderState.isSettingsOpen) panel.style.display = 'none'; }, 240);
+  function _createItem() {
+    const div = document.createElement('div');
+    div.className = 'search-result-item';
+    div.setAttribute('role', 'option');
+    div.style.cssText = `min-height:${ITEM_H}px;padding:10px 16px;border-bottom:1px solid var(--color-border-soft);cursor:pointer;`;
+    div.innerHTML = '<div class="sri-section" style="font-size:10px;color:var(--color-ink-muted);margin-bottom:3px;"></div><p class="sri-snippet" style="font-size:12px;line-height:1.5;margin:0;color:var(--color-ink-soft);"></p>';
+    return div;
   }
-  DOMProxy.get('btn-settings-toggle')?.classList.remove('active');
-  ReaderState.isSettingsOpen = false;
-}
+
+  function _renderChunk(start, q) {
+    if (!container) return;
+    const end = Math.min(start + VISIBLE, allResults.length);
+    const frag = document.createDocumentFragment();
+    for (let i = start; i < end; i++) {
+      const m = allResults[i], node = pool.pop() || _createItem();
+      node.querySelector('.sri-section').textContent = `${i+1}. ${(m.sectionHref||'').split('/').pop()}`;
+      const snip = node.querySelector('.sri-snippet'); snip.innerHTML = '';
+      const re = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`, 'gi');
+      m.context.split(re).forEach(part => {
+        if (re.test(part)) { const mk = document.createElement('mark'); mk.className='fable-search-mark'; mk.textContent=part; snip.appendChild(mk); re.lastIndex=0; }
+        else snip.appendChild(document.createTextNode(part));
+      });
+      node.onclick = async () => {
+        DOMProxy.get('search-modal').style.display = 'none';
+        if (store.rendition && m.cfi) { try { await store.rendition.display(m.cfi); setTimeout(() => injectSearchHighlight(m.cfi), 400); } catch (_) {} }
+      };
+      frag.appendChild(node);
+    }
+    container.appendChild(frag); renderedStart = end;
+  }
+
+  function _setupSentinel() {
+    sentinel = document.createElement('div'); sentinel.style.height = '1px';
+    container.appendChild(sentinel);
+    observer = new IntersectionObserver(entries => {
+      if (!entries[0].isIntersecting || renderedStart >= allResults.length) return;
+      const old = container.querySelectorAll('.search-result-item');
+      if (old.length > VISIBLE * 2) { Array.from(old).slice(0, old.length - VISIBLE).forEach(n => { pool.push(n); n.remove(); }); }
+      _renderChunk(renderedStart, _q); container.appendChild(sentinel);
+    }, { threshold: 0.1 });
+    observer.observe(sentinel);
+  }
+
+  function render(containerEl, results, query) {
+    if (observer) { observer.disconnect(); observer = null; }
+    pool = []; allResults = results; container = containerEl; renderedStart = 0; _q = query;
+    container.innerHTML = '';
+    if (!results.length) {
+      const p = document.createElement('p'); p.style.cssText='padding:20px;text-align:center;color:var(--color-ink-muted);font-size:13px;';
+      p.textContent='검색 결과가 없습니다.'; container.appendChild(p); return;
+    }
+    _renderChunk(0, query); _setupSentinel();
+  }
+
+  function destroy() { if (observer) { observer.disconnect(); observer = null; } pool=[]; allResults=[]; container=null; sentinel=null; }
+  return { render, destroy };
+})();
 
 /* ══════════════════════════════════════════════════════════
-   15. [UX#13] 전문 검색 엔진 (mark 태그 하이라이트)
+   §21. 전문 검색 엔진
    ══════════════════════════════════════════════════════════ */
 const SearchEngine = (() => {
-  let index   = new Map(); // word → [{sectionHref, cfi, context}]
-  let isBuilt = false;
+  let index = new Map(), isBuilt = false;
 
   async function build(book) {
     if (isBuilt || !book) return;
     index.clear();
-    const parser = new DOMParser();
-    const items  = book.spine?.items || [];
-
+    const parser = new DOMParser(), items = book.spine?.items || [];
     for (const item of items) {
       try {
         const section = book.spine.get(item.href || item.idref);
         if (!section) continue;
         await section.load(book.load.bind(book));
-        const doc    = parser.parseFromString(section.content || '<html></html>', 'text/html');
-        const paras  = Array.from(doc.querySelectorAll('p,h1,h2,h3,li'));
-
-        paras.forEach(p => {
+        const doc = parser.parseFromString(section.content || '<html></html>', 'text/html');
+        Array.from(doc.querySelectorAll('p,h1,h2,h3,li')).forEach(p => {
           const text = p.textContent?.trim() || '';
           if (text.length < 3) return;
-          let cfi = '';
-          try { cfi = section.cfiFromElement(p); } catch (_) { cfi = item.href || ''; }
-
+          let cfi = ''; try { cfi = section.cfiFromElement(p); } catch (_) { cfi = item.href || ''; }
           new Set(text.toLowerCase().split(/\s+/).filter(w => w.length >= 2)).forEach(word => {
             if (!index.has(word)) index.set(word, []);
             index.get(word).push({ sectionHref: item.href || '', cfi, context: text.slice(0, 120) });
           });
         });
-        section.unload();
-        await new Promise(r => setTimeout(r, 0)); // yield
+        section.unload(); await new Promise(r => setTimeout(r, 0));
       } catch (_) {}
     }
     isBuilt = true;
@@ -947,14 +1044,10 @@ const SearchEngine = (() => {
 
   function query(keyword) {
     if (!isBuilt || keyword.length < 2) return [];
-    const kw = keyword.toLowerCase().trim();
-    const results = [];
-    const seen = new Set();
+    const kw = keyword.toLowerCase().trim(), results = [], seen = new Set();
     for (const [key, list] of index.entries()) {
-      if (key.includes(kw)) {
-        list.forEach(r => { if (!seen.has(r.cfi)) { seen.add(r.cfi); results.push(r); } });
-      }
-      if (results.length >= 80) break;
+      if (key.includes(kw)) list.forEach(r => { if (!seen.has(r.cfi)) { seen.add(r.cfi); results.push(r); } });
+      if (results.length >= 200) break;
     }
     return results;
   }
@@ -964,120 +1057,45 @@ const SearchEngine = (() => {
 })();
 
 function runSearchExecution() {
-  const qEl       = DOMProxy.get('input-search-query');
-  const container = DOMProxy.get('search-results-container');
-  if (!qEl || !container) return;
-
-  const q = qEl.value.trim();
-  container.innerHTML = '';
-
-  if (q.length < 2) {
-    Toast.show('검색어는 2글자 이상 입력하세요.', 'error');
-    return;
-  }
-
-  const matches = SearchEngine.query(q);
-  if (matches.length === 0) {
-    container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--color-ink-muted);font-size:13px;">검색 결과가 없습니다.</p>';
-    return;
-  }
-
-  const frag = document.createDocumentFragment();
-  matches.forEach(m => {
-    const div  = document.createElement('div');
-    div.className = 'search-result-item';
-    div.style.cssText = 'padding:10px 16px;border-bottom:1px solid var(--color-border-soft);cursor:pointer;';
-
-    /* [UX#13] mark 태그 하이라이트 */
-    const p = document.createElement('p');
-    p.style.cssText = 'font-size:12px;line-height:1.6;margin:0;color:var(--color-ink-soft);';
-    const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    const parts = m.context.split(regex);
-    parts.forEach(part => {
-      if (regex.test(part)) {
-        const mark = document.createElement('mark');
-        mark.className = 'fable-search-mark';
-        mark.textContent = part;
-        p.appendChild(mark);
-        regex.lastIndex = 0;
-      } else {
-        p.appendChild(document.createTextNode(part));
-      }
-    });
-
-    div.appendChild(p);
-    div.addEventListener('click', async () => {
-      DOMProxy.get('search-modal').style.display = 'none';
-      if (ReaderState.rendition && m.cfi) {
-        try {
-          await ReaderState.rendition.display(m.cfi);
-          /* iframe 내부에도 mark 주입 */
-          setTimeout(() => injectSearchHighlight(m.cfi, q), 400);
-        } catch (_) {}
-      }
-    });
-    frag.appendChild(div);
-  });
-  container.appendChild(frag);
+  const q = DOMProxy.get('input-search-query').value?.trim() ?? '';
+  if (q.length < 2) { Toast.show('검색어는 2글자 이상 입력하세요.', 'error'); return; }
+  VirtualSearchList.render(DOMProxy.get('search-results-container'), SearchEngine.query(q), q);
 }
 
-function injectSearchHighlight(cfi, keyword) {
-  if (!ReaderState.rendition) return;
-  try {
-    ReaderState.rendition.annotations.add('highlight', cfi, {}, null, 'fable-search-hl');
-    setTimeout(() => {
-      try { ReaderState.rendition?.annotations?.remove(cfi, 'highlight'); } catch (_) {}
-    }, 3000);
-  } catch (_) {}
+function injectSearchHighlight(cfi) {
+  if (!store.rendition) return;
+  try { store.rendition.annotations.add('highlight', cfi, {}, null, 'fable-search-hl'); setTimeout(() => { try { store.rendition?.annotations?.remove(cfi, 'highlight'); } catch (_) {} }, 3000); }
+  catch (_) {}
 }
 
 /* ══════════════════════════════════════════════════════════
-   16. 서재 그리드 렌더링 ([UX#2] 스켈레톤 UI)
+   §22. 서재 그리드 ([UX#2] 스켈레톤 UI)
    ══════════════════════════════════════════════════════════ */
 function renderLibraryGrid() {
   const grid = DOMProxy.get('library-grid');
-  if (!grid) return;
-
-  /* 스켈레톤 표시 */
+  if (!DOMProxy.exists('library-grid')) return;
   grid.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>';
 
   StorageSystem.getAllBooks().then(books => {
     grid.innerHTML = '';
-    if (books.length === 0) {
+    if (!books.length) {
       const p = document.createElement('p');
       p.style.cssText = 'grid-column:1/-1;font-size:12px;color:var(--color-ink-muted);text-align:center;padding:16px;';
-      p.textContent = '저장된 도서가 없습니다. EPUB 파일을 업로드해 주세요.';
-      grid.appendChild(p);
-      return;
+      p.textContent = '저장된 도서가 없습니다. EPUB 파일을 업로드해 주세요.'; grid.appendChild(p); return;
     }
-
     const frag = document.createDocumentFragment();
     books.forEach(b => {
-      const card = document.createElement('div');
-      card.className = 'book-card';
-
-      const cover = document.createElement('div');
-      cover.className = 'book-cover-placeholder';
-      cover.textContent = 'EPUB';
-
-      const titleEl = document.createElement('div');
-      titleEl.className = 'book-card-title';
-      titleEl.textContent = b.title || '제목 없음';
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'btn-delete-book';
-      delBtn.textContent = '✕';
-      delBtn.title = '서재에서 제거';
+      const card = document.createElement('div'); card.className = 'book-card'; card.setAttribute('role','listitem');
+      const cover = document.createElement('div'); cover.className = 'book-cover-placeholder'; cover.textContent = 'EPUB'; cover.setAttribute('aria-hidden','true');
+      const titleEl = document.createElement('div'); titleEl.className = 'book-card-title'; titleEl.textContent = b.title || '제목 없음';
+      const delBtn = document.createElement('button'); delBtn.className = 'btn-delete-book'; delBtn.textContent = '✕';
+      delBtn.title = '서재에서 제거'; delBtn.setAttribute('aria-label', (b.title||'도서') + ' 서재에서 제거');
       delBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (confirm('이 도서를 서재에서 제거하시겠습니까?')) {
-          StorageSystem.deleteBook(b.bookKey).then(() => renderLibraryGrid());
-        }
+        if (confirm('이 도서를 서재에서 제거하시겠습니까?')) StorageSystem.deleteBook(b.bookKey).then(() => renderLibraryGrid());
       });
-
-      card.appendChild(cover);
-      card.appendChild(titleEl);
-      card.appendChild(delBtn);
+      card.appendChild(cover); card.appendChild(titleEl); card.appendChild(delBtn);
+      card.setAttribute('aria-label', (b.title||'제목 없음') + ' 열기');
       card.addEventListener('click', () => openEpubBook(b.bytes, true));
       frag.appendChild(card);
     });
@@ -1086,615 +1104,350 @@ function renderLibraryGrid() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   17. [UX#11] TTS 엔진 + 진행 바
+   §23. [UX#11] TTS 엔진
    ══════════════════════════════════════════════════════════ */
 const TTSSystem = (() => {
-  let utterance   = null;
-  let isPaused    = false;
-  let totalLen    = 0;
-  let currentChar = 0;
-  let rafId       = null;
-
+  let utterance = null, isPaused = false, totalLen = 0;
   function play(text) {
     if (!text) return;
-    window.speechSynthesis.cancel();
-    totalLen    = text.length;
-    currentChar = 0;
-
-    utterance          = new SpeechSynthesisUtterance(text);
-    utterance.lang     = 'ko-KR';
-    utterance.rate     = 1.0;
-
-    /* [UX#11] boundary 이벤트로 진행 바 업데이트 */
-    utterance.onboundary = (e) => {
-      if (e.charIndex != null) {
-        currentChar = e.charIndex;
-        updateTTSProgress(currentChar / totalLen);
-      }
-    };
-    utterance.onend  = () => { hideBar(); cancelRaf(); };
-    utterance.onerror = () => { hideBar(); cancelRaf(); };
-
-    isPaused = false;
-    window.speechSynthesis.speak(utterance);
-    DOMProxy.get('tts-player-bar').style.display = 'flex';
-    setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸');
+    window.speechSynthesis.cancel(); totalLen = text.length;
+    utterance = new SpeechSynthesisUtterance(text); utterance.lang = 'ko-KR'; utterance.rate = 1.0;
+    utterance.onboundary = (e) => { if (e.charIndex != null) { DOMProxy.get('tts-progress-fill').style.width = `${Math.min(100,(e.charIndex/totalLen)*100)}%`; } };
+    utterance.onend = utterance.onerror = () => { DOMProxy.get('tts-player-bar').style.display='none'; DOMProxy.get('tts-progress-fill').style.width='0%'; };
+    isPaused = false; window.speechSynthesis.speak(utterance);
+    DOMProxy.get('tts-player-bar').style.display = 'flex'; setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸');
   }
-
-  function updateTTSProgress(ratio) {
-    const fill = DOMProxy.get('tts-progress-fill');
-    if (fill) fill.style.width = `${Math.min(100, ratio * 100)}%`;
-  }
-
   function pauseResume() {
-    if (isPaused) {
-      window.speechSynthesis.resume();
-      isPaused = false;
-      setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸');
-    } else {
-      window.speechSynthesis.pause();
-      isPaused = true;
-      setTextSafe(DOMProxy.get('btn-tts-play-pause'), '▶');
-    }
+    if (isPaused) { window.speechSynthesis.resume(); isPaused = false; setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸'); }
+    else { window.speechSynthesis.pause(); isPaused = true; setTextSafe(DOMProxy.get('btn-tts-play-pause'), '▶'); }
   }
-
-  function stop() { window.speechSynthesis.cancel(); hideBar(); cancelRaf(); }
-
-  function hideBar() {
-    const bar = DOMProxy.get('tts-player-bar');
-    if (bar) bar.style.display = 'none';
-    updateTTSProgress(0);
-  }
-
-  function cancelRaf() { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } }
-
+  function stop() { window.speechSynthesis.cancel(); DOMProxy.get('tts-player-bar').style.display='none'; }
   return { play, pauseResume, stop };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   18. [UX#15] 독서 통계 + 목표 달성 탄력 모션
+   §24. [UX#15] 독서 통계 + 탄력 모션
    ══════════════════════════════════════════════════════════ */
 const ReadingStatsTracker = (() => {
   let timer = null;
-
   function startSession() {
-    ReaderState.readingSession.startTime = Date.now();
+    store.readingSession.startTime = Date.now();
     clearInterval(timer);
     timer = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        ReaderState.readingSession.accumulated++;
-        _updateUI();
-      }
+      if (document.visibilityState === 'visible') { store.readingSession.accumulated++; _updateUI(); }
     }, 1000);
+    ResourceRegistry.addTimer(timer);
   }
-
   function stopSession() { clearInterval(timer); }
-
-  function markPosition(cfi) {
-    if (cfi) ReaderState.readingSession.positions.add(cfi);
-    _updateUI();
-  }
-
+  function markPosition(cfi) { if (cfi) store.readingSession.positions.add(cfi); _updateUI(); }
   function _updateUI() {
-    const total = ReaderState.readingSession.accumulated;
-    const min   = Math.floor(total / 60);
-    const sec   = total % 60;
+    const total = store.readingSession.accumulated, min = Math.floor(total / 60), sec = total % 60;
     setTextSafe(DOMProxy.get('stat-reading-time'), `${min}분 ${sec}초`);
-    setTextSafe(DOMProxy.get('stat-pages-read'), String(ReaderState.readingSession.positions.size));
-
-    /* [UX#15] 목표 달성 cubic-bezier 모션 */
+    setTextSafe(DOMProxy.get('stat-pages-read'), String(store.readingSession.positions.size));
     const goalMin = parseInt(localStorage.getItem('fable_daily_goal') || '30', 10);
-    const fill    = DOMProxy.get('goal-progress-fill');
-    if (fill) {
-      const pct = Math.min(100, (min / goalMin) * 100);
-      fill.style.transition = 'width 600ms cubic-bezier(0.34,1.56,0.64,1)';
-      fill.style.width = `${pct}%`;
-      if (pct >= 100 && fill.dataset.notified !== '1') {
-        fill.dataset.notified = '1';
-        Toast.show('🎉 오늘의 독서 목표를 달성했습니다!', 'success');
-      }
-    }
+    const fill = DOMProxy.get('goal-progress-fill'), pct = Math.min(100, (min / goalMin) * 100);
+    fill.style.transition = 'width 600ms cubic-bezier(0.34,1.56,0.64,1)'; fill.style.width = `${pct}%`;
+    DOMProxy.q('.goal-track').setAttribute('aria-valuenow', Math.round(pct));
+    if (pct >= 100 && fill.dataset.notified !== '1') { fill.dataset.notified = '1'; Toast.show('\uD83C\uDF89 오늘의 독서 목표를 달성했습니다!', 'success'); }
   }
-
   return { startSession, stopSession, markPosition };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   19. [UX#14] 롱프레스 컨텍스트 메뉴
+   §25. [UX#14] 롱프레스 컨텍스트 메뉴
    ══════════════════════════════════════════════════════════ */
 function initContextMenu() {
   const viewer = DOMProxy.get('screen-viewer');
-  if (!viewer) return;
+  if (!DOMProxy.exists('screen-viewer')) return;
+  let longPressTimer = null, selectedText = '';
 
-  let longPressTimer = null;
-  let selectedText   = '';
+  function showMenu() { if (!selectedText) return; const m = DOMProxy.get('context-menu'); m.style.display='flex'; m.classList.add('slide-up'); }
+  function hideMenu() { const m = DOMProxy.get('context-menu'); m.classList.remove('slide-up'); setTimeout(() => { m.style.display='none'; }, 280); }
 
-  function showMenu() {
-    const menu = DOMProxy.get('context-menu');
-    if (!menu || !selectedText) return;
-    menu.style.display = 'flex';
-    menu.classList.add('slide-up');
-  }
-
-  function hideMenu() {
-    const menu = DOMProxy.get('context-menu');
-    if (!menu) return;
-    menu.classList.remove('slide-up');
-    setTimeout(() => { if (menu) menu.style.display = 'none'; }, 280);
-  }
-
-  viewer.addEventListener('touchstart', (e) => {
-    const touch = e.touches[0];
+  const onStart = (e) => {
     longPressTimer = setTimeout(() => {
-      if (ReaderState.rendition) {
-        /* iframe selection 취득 시도 */
-        try {
-          const iframes = DOMProxy.get('viewer-viewport')?.querySelectorAll('iframe') || [];
-          iframes.forEach(f => {
-            const sel = f.contentWindow?.getSelection()?.toString()?.trim() || '';
-            if (sel.length > 1) selectedText = sel;
-          });
-        } catch (_) {}
+      if (store.rendition) {
+        try { DOMProxy.get('viewer-viewport').querySelectorAll('iframe').forEach(f => { const s = f.contentWindow?.getSelection()?.toString()?.trim(); if (s?.length > 1) selectedText = s; }); } catch (_) {}
       }
       if (selectedText) showMenu();
     }, 600);
-  }, { passive: true });
+  };
+  ResourceRegistry.addListener(viewer, 'touchstart', onStart, { passive: true });
+  ResourceRegistry.addListener(viewer, 'touchend',   () => clearTimeout(longPressTimer), { passive: true });
+  ResourceRegistry.addListener(viewer, 'touchmove',  () => clearTimeout(longPressTimer), { passive: true });
+  ResourceRegistry.addListener(document, 'pointerdown', (e) => { if (!DOMProxy.get('context-menu').contains?.(e.target)) { hideMenu(); selectedText = ''; } }, { passive: true });
 
-  viewer.addEventListener('touchend', () => {
-    clearTimeout(longPressTimer);
-  }, { passive: true });
-
-  viewer.addEventListener('touchmove', () => {
-    clearTimeout(longPressTimer);
-  }, { passive: true });
-
-  document.addEventListener('pointerdown', (e) => {
-    if (!DOMProxy.get('context-menu')?.contains(e.target)) {
-      hideMenu();
-      selectedText = '';
-    }
-  }, { passive: true });
-
-  DOMProxy.get('ctx-copy')?.addEventListener('click', () => {
-    if (selectedText) navigator.clipboard?.writeText(selectedText).catch(() => {});
-    Toast.show('클립보드에 복사했습니다.');
-    hideMenu();
-  });
-
-  DOMProxy.get('ctx-tts')?.addEventListener('click', () => {
-    if (selectedText) TTSSystem.play(selectedText);
-    hideMenu();
-  });
-
-  DOMProxy.get('ctx-search')?.addEventListener('click', () => {
-    const modal = DOMProxy.get('search-modal');
-    const input = DOMProxy.get('input-search-query');
-    if (modal && input) {
-      input.value = selectedText;
-      modal.style.display = 'flex';
-      runSearchExecution();
-    }
-    hideMenu();
-  });
-
-  DOMProxy.get('ctx-highlight')?.addEventListener('click', () => {
-    Toast.show('하이라이트 기능은 선택 후 애노테이션 패널에서 이용하세요.');
-    hideMenu();
-  });
+  DOMProxy.get('ctx-copy').addEventListener('click', () => { if (selectedText) navigator.clipboard?.writeText(selectedText).catch(() => {}); Toast.show('클립보드에 복사했습니다.'); hideMenu(); });
+  DOMProxy.get('ctx-tts').addEventListener('click', () => { if (selectedText) TTSSystem.play(selectedText); hideMenu(); });
+  DOMProxy.get('ctx-search').addEventListener('click', () => { const m=DOMProxy.get('search-modal'), i=DOMProxy.get('input-search-query'); i.value=selectedText; m.style.display='flex'; runSearchExecution(); hideMenu(); });
+  DOMProxy.get('ctx-highlight').addEventListener('click', () => { Toast.show('하이라이트 기능은 텍스트 선택 후 자동 추가됩니다.'); hideMenu(); });
 }
 
 /* ══════════════════════════════════════════════════════════
-   20. [UX#12] 폰트 업로드 샌드박스 안정화
+   §26. [UX#21] 어노테이션 매니저
+   ══════════════════════════════════════════════════════════ */
+const AnnotationManager = (() => {
+  let _rendition = null;
+  function init(rendition) {
+    _rendition = rendition;
+    rendition.on('selected', async (cfiRange, contents) => {
+      const sel = contents.window.getSelection();
+      if (!sel || sel.isCollapsed || sel.toString().trim().length < 2) return;
+      try {
+        const ann = await AnnotationSyncEngine.create(store.bookKey, cfiRange, sel.toString().trim(), 'yellow');
+        rendition.annotations.add('highlight', cfiRange, { uuid: ann.uuid }, null, 'hl-yellow');
+        Toast.show('하이라이트가 저장되었습니다.', 'success');
+      } catch (e) { ErrorBoundary.handle('storage', e, 'annotation:create'); }
+    });
+  }
+  function restoreAll(annotations) {
+    if (!_rendition) return;
+    annotations.forEach(ann => { try { _rendition.annotations.add('highlight', ann.cfiRange, { uuid: ann.uuid }, null, 'hl-' + (ann.color||'yellow')); } catch (_) {} });
+  }
+  function reset() { _rendition = null; }
+  return { init, restoreAll, reset };
+})();
+
+function initAnnotationManager(rendition) { AnnotationManager.init(rendition); }
+
+/* ══════════════════════════════════════════════════════════
+   §27. [UX#12] 폰트 업로드 샌드박스
    ══════════════════════════════════════════════════════════ */
 function initFontUploader() {
-  const input = DOMProxy.get('font-uploader');
-  if (!input) return;
-
-  input.addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
+  if (!DOMProxy.exists('font-uploader')) return;
+  DOMProxy.get('font-uploader').addEventListener('change', (e) => {
+    const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = async (evt) => {
-      const fontUrl = evt.target.result;
-      /* [UX#12] 한글/특수문자 파일명 정제 → 랜덤 해시 ID */
-      const safeId  = `custom_${Math.random().toString(36).slice(2, 10)}`;
+      const safeId = 'custom_' + Math.random().toString(36).slice(2, 10);
       try {
-        const face = new FontFace(safeId, `url(${fontUrl})`);
-        const loaded = await face.load();
-        document.fonts.add(loaded);
-        if (ReaderState.rendition) {
-          ReaderState.rendition.themes.font(safeId);
-          Toast.show('커스텀 폰트가 적용되었습니다.', 'success');
-        }
-      } catch (err) {
-        Toast.show(`폰트 로드 실패: ${err.message}`, 'error');
-      }
+        const face = new FontFace(safeId, `url(${evt.target.result})`);
+        const loaded = await face.load(); document.fonts.add(loaded);
+        if (store.rendition) { store.rendition.themes.font(safeId); Toast.show('커스텀 폰트가 적용되었습니다.', 'success'); }
+      } catch (err) { Toast.show(`폰트 로드 실패: ${err.message}`, 'error'); }
     };
-    reader.readAsDataURL(file);
-    input.value = '';
+    reader.readAsDataURL(file); e.target.value = '';
   });
 }
 
 /* ══════════════════════════════════════════════════════════
-   21. [UX#17] 키보드 단축키 팁 레이어
+   §28. [UX#23] 커스텀 테마 빌더
    ══════════════════════════════════════════════════════════ */
-function showKeyboardHint() {
-  const shown = localStorage.getItem('fable_keyboard_hint_shown');
-  if (shown) return;
-  const layer = DOMProxy.get('keyboard-hint-layer');
-  if (layer) {
-    layer.style.display = 'flex';
-    localStorage.setItem('fable_keyboard_hint_shown', '1');
+function initCustomThemeBuilder() {
+  function syncColor(colorId, hexId, storeKey) {
+    const colorEl = DOMProxy.get(colorId), hexEl = DOMProxy.get(hexId);
+    colorEl.addEventListener('input', () => { const v=colorEl.value; hexEl.value=v; store[storeKey]=v; _saveStateToLS(); });
+    hexEl.addEventListener('input', () => { const v=hexEl.value.trim(); if (/^#[0-9A-Fa-f]{6}$/.test(v)) { colorEl.value=v; store[storeKey]=v; _saveStateToLS(); } });
   }
+  syncColor('input-user-bg', 'input-user-bg-hex', 'userBg');
+  syncColor('input-user-ink','input-user-ink-hex','userInk');
+  DOMProxy.get('input-user-spacing').addEventListener('input', () => { const v=parseFloat(DOMProxy.get('input-user-spacing').value); setTextSafe(DOMProxy.get('spacing-val'), v+'em'); store.userSpacing=v; _saveStateToLS(); });
+  DOMProxy.get('input-user-leading').addEventListener('input', () => { const v=parseFloat(DOMProxy.get('input-user-leading').value); setTextSafe(DOMProxy.get('leading-val'), String(v)); store.userLeading=v; _saveStateToLS(); });
 }
 
 /* ══════════════════════════════════════════════════════════
-   22. [UX#18] 오프라인 감지 배너
-   ══════════════════════════════════════════════════════════ */
-function initOfflineBanner() {
-  function update(offline) {
-    const banners = [DOMProxy.get('offline-banner'), DOMProxy.get('offline-banner-viewer')];
-    banners.forEach(b => { if (b) b.style.display = offline ? 'flex' : 'none'; });
-  }
-
-  window.addEventListener('offline',  () => { update(true);  Toast.show('인터넷 연결이 끊겼습니다. 오프라인 모드로 작동 중입니다.'); });
-  window.addEventListener('online',   () => { update(false); Toast.show('인터넷 연결이 복원되었습니다.', 'success'); });
-
-  if (!navigator.onLine) update(true);
-}
-
-/* ══════════════════════════════════════════════════════════
-   23. [UX#19] 스크롤 모드 맨위로 버튼
-   ══════════════════════════════════════════════════════════ */
-function bindScrollTopButton(view) {
-  const btn = DOMProxy.get('btn-scroll-top');
-  if (!btn) return;
-
-  const iframe = view?.element?.querySelector('iframe');
-  if (!iframe) return;
-
-  const contentWin = iframe.contentWindow;
-  if (!contentWin) return;
-
-  contentWin.addEventListener('scroll', () => {
-    const scrolled = contentWin.scrollY > 200;
-    btn.style.display = scrolled ? 'flex' : 'none';
-  }, { passive: true });
-
-  btn.onclick = () => {
-    contentWin.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-}
-
-/* ══════════════════════════════════════════════════════════
-   24. 어노테이션 초기화 (선택 → 액션 바)
-   ══════════════════════════════════════════════════════════ */
-function initAnnotationManager(rendition) {
-  /* highlight 스타일 주입 */
-  rendition.hooks.content.register((contents) => {
-    const doc = contents.document;
-    if (doc.getElementById('fable-hl-styles')) return;
-    const style = doc.createElement('style');
-    style.id = 'fable-hl-styles';
-    style.textContent = `
-      .hl-yellow { background: rgba(255,235,59,0.45) !important; border-bottom: 2px solid #f5c800 !important; }
-      .hl-green  { background: rgba(105,240,174,0.4) !important; border-bottom: 2px solid #00c853 !important; }
-      .fable-search-hl { background: rgba(255,165,0,0.45) !important; border-radius: 3px; }
-    `;
-    doc.head.appendChild(style);
-  });
-
-  rendition.on('selected', (cfiRange, contents) => {
-    const sel = contents.window.getSelection();
-    if (!sel || sel.isCollapsed || sel.toString().trim().length < 2) return;
-    const text = sel.toString().trim();
-
-    /* 간단한 하이라이트 저장 */
-    const id = `hl_${Date.now()}`;
-    try {
-      rendition.annotations.add('highlight', cfiRange, { id }, null, 'hl-yellow');
-      const key = `fable_hl_${ReaderState.bookKey}`;
-      const existing = StorageSystem.lsGet(key, []);
-      existing.push({ id, cfiRange, text: text.slice(0, 400), color: 'yellow', ts: Date.now() });
-      StorageSystem.lsSet(key, existing);
-      Toast.show('하이라이트가 저장되었습니다.', 'success');
-    } catch (_) {}
-  });
-}
-
-/* ══════════════════════════════════════════════════════════
-   25. 전역 키보드 이벤트 ([UX#17])
+   §29. 키보드 단축키 & 단축키 팁
    ══════════════════════════════════════════════════════════ */
 function handleKeyDown(e) {
   const viewer = DOMProxy.get('screen-viewer');
-  if (!viewer || viewer.style.display === 'none') return;
-  if (!ReaderState.rendition) return;
-
+  if (!DOMProxy.exists('screen-viewer') || viewer.style.display === 'none') return;
+  if (!store.rendition) return;
   switch (e.key) {
-    case 'ArrowRight': case 'ArrowDown': case ' ':
-      e.preventDefault(); NavGuard.next(); break;
-    case 'ArrowLeft': case 'ArrowUp': case 'Backspace':
-      e.preventDefault(); NavGuard.prev(); break;
+    case 'ArrowRight': case 'ArrowDown': case ' ':     e.preventDefault(); NavGuard.next(); break;
+    case 'ArrowLeft':  case 'ArrowUp':  case 'Backspace': e.preventDefault(); NavGuard.prev(); break;
     case 'Escape':
-      if (ReaderState.isSettingsOpen) { closeSettingsPanel(); break; }
-      if (ReaderState.isTocOpen)      { closeTocSidebar();    break; }
-      if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer();
-      break;
+      if (store.isSettingsOpen) { store.isSettingsOpen = false; break; }
+      if (store.isTocOpen)      { store.isTocOpen      = false; break; }
+      if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer(); break;
     default: break;
   }
 }
 
+function showKeyboardHint() {
+  if (localStorage.getItem('fable_keyboard_hint_shown')) return;
+  DOMProxy.get('keyboard-hint-layer').style.display = 'flex';
+  localStorage.setItem('fable_keyboard_hint_shown', '1');
+}
+
 /* ══════════════════════════════════════════════════════════
-   26. 버튼 이벤트 전체 바인딩
+   §30. 오프라인 배너 + 동기화 트리거
+   ══════════════════════════════════════════════════════════ */
+function initOfflineBanner() {
+  function update(offline) {
+    [DOMProxy.get('offline-banner'), DOMProxy.get('offline-banner-viewer')].forEach(b => { b.style.display = offline ? 'flex' : 'none'; });
+  }
+  window.addEventListener('offline', () => { update(true); Toast.show('인터넷 연결이 끊겼습니다. 오프라인 모드로 작동 중입니다.'); });
+  window.addEventListener('online',  async () => { update(false); Toast.show('인터넷 연결이 복원되었습니다.', 'success'); await AnnotationSyncEngine.syncPending(); });
+  if (!navigator.onLine) update(true);
+}
+
+/* ══════════════════════════════════════════════════════════
+   §31. 스크롤 맨위로 버튼
+   ══════════════════════════════════════════════════════════ */
+function bindScrollTopButton(view) {
+  const btn = DOMProxy.get('btn-scroll-top');
+  const iframe = view?.element?.querySelector('iframe');
+  if (!iframe) return;
+  const cw = iframe.contentWindow; if (!cw) return;
+  const onScroll = () => { btn.style.display = cw.scrollY > 200 ? 'flex' : 'none'; };
+  ResourceRegistry.addListener(cw, 'scroll', onScroll, { passive: true });
+  btn.onclick = () => cw.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+/* ══════════════════════════════════════════════════════════
+   §32. 설정 저장 / 복원
+   ══════════════════════════════════════════════════════════ */
+function _saveStateToLS() {
+  const snap = { fontSize: store.fontSize, lineHeight: store.lineHeight, theme: store.theme, flow: store.flow,
+                 userBg: store.userBg, userInk: store.userInk, userSpacing: store.userSpacing, userLeading: store.userLeading };
+  try { localStorage.setItem(STATE_KEY, JSON.stringify(snap)); } catch (_) {}
+}
+
+function _loadStateFromLS() {
+  try {
+    const raw = localStorage.getItem(STATE_KEY); if (!raw) return;
+    const s = JSON.parse(raw);
+    ReactiveStore.patch({
+      fontSize: s.fontSize ?? 100, lineHeight: s.lineHeight ?? 'normal', theme: s.theme ?? 'paper', flow: s.flow ?? 'paginated',
+      userBg: s.userBg ?? '#f4f1ea', userInk: s.userInk ?? '#1a1814', userSpacing: s.userSpacing ?? 0, userLeading: s.userLeading ?? 1.85,
+    });
+  } catch (_) {}
+}
+
+/* ══════════════════════════════════════════════════════════
+   §33. 버튼 이벤트 전체 바인딩
    ══════════════════════════════════════════════════════════ */
 function initButtonEventHandlers() {
+  const dropzone = DOMProxy.get('dropzone'), fileInput = DOMProxy.get('file-input');
 
-  /* ── 업로더 ── */
-  const dropzone  = DOMProxy.get('dropzone');
-  const fileInput = DOMProxy.get('file-input');
+  DOMProxy.get('btn-file-select').addEventListener('click', (e) => { e.stopPropagation(); fileInput.click(); });
+  fileInput.addEventListener('change', async (e) => { const f = e.target.files[0]; if (f) await openEpubBook(f, false); fileInput.value = ''; });
 
-  DOMProxy.get('btn-file-select')?.addEventListener('click', (e) => {
-    e.stopPropagation();
-    fileInput?.click();
-  });
-
-  fileInput?.addEventListener('change', async (e) => {
-    const f = e.target.files[0];
-    if (f) await openEpubBook(f, false);
-    fileInput.value = '';
-  });
-
-  /* [UX#1] 드롭존 마이크로 인터랙션 */
-  if (dropzone) {
-    dropzone.addEventListener('click', () => fileInput?.click());
-
-    dropzone.addEventListener('dragenter', (e) => {
-      e.preventDefault();
-      dropzone.classList.add('drag-over');
-    });
-    dropzone.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
-      dropzone.classList.add('drag-over');
-    });
-    dropzone.addEventListener('dragleave', (e) => {
-      if (dropzone.contains(e.relatedTarget)) return;
-      dropzone.classList.remove('drag-over');
-    });
+  if (DOMProxy.exists('dropzone')) {
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragenter', (e) => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+    dropzone.addEventListener('dragover',  (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; dropzone.classList.add('drag-over'); });
+    dropzone.addEventListener('dragleave', (e) => { if (!dropzone.contains(e.relatedTarget)) dropzone.classList.remove('drag-over'); });
     dropzone.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      dropzone.classList.remove('drag-over');
-      /* 바운스 애니메이션 트리거 */
-      dropzone.classList.add('drop-bounce');
-      setTimeout(() => dropzone.classList.remove('drop-bounce'), 600);
-
-      const files = e.dataTransfer.files;
-      if (!files?.length) return;
+      e.preventDefault(); dropzone.classList.remove('drag-over');
+      dropzone.classList.add('drop-bounce'); setTimeout(() => dropzone.classList.remove('drop-bounce'), 600);
+      const files = e.dataTransfer.files; if (!files?.length) return;
       if (files.length > 1) { Toast.show('파일은 하나씩만 열 수 있습니다.', 'error'); return; }
       await openEpubBook(files[0], false);
     });
   }
 
-  /* ── 뷰어 ── */
-  DOMProxy.get('arrow-prev')?.addEventListener('click', () => NavGuard.prev());
-  DOMProxy.get('arrow-next')?.addEventListener('click', () => NavGuard.next());
+  DOMProxy.get('arrow-prev').addEventListener('click', () => NavGuard.prev());
+  DOMProxy.get('arrow-next').addEventListener('click', () => NavGuard.next());
 
-  DOMProxy.get('btn-toc-toggle')?.addEventListener('click', () => {
-    ReaderState.isTocOpen ? closeTocSidebar() : openTocSidebar();
-  });
-  DOMProxy.get('btn-toc-close')?.addEventListener('click', () => closeTocSidebar());
+  DOMProxy.get('btn-toc-toggle').addEventListener('click', () => { store.isTocOpen = !store.isTocOpen; });
+  DOMProxy.get('btn-toc-close').addEventListener('click',  () => { store.isTocOpen = false; });
+  DOMProxy.get('toc-overlay').addEventListener('click',    () => { store.isTocOpen = false; });
 
-  DOMProxy.get('toc-overlay')?.addEventListener('click', () => closeTocSidebar());
+  DOMProxy.get('btn-settings-toggle').addEventListener('click', () => { store.isSettingsOpen = !store.isSettingsOpen; });
+  DOMProxy.get('btn-settings-close').addEventListener('click',  () => { store.isSettingsOpen = false; });
+  DOMProxy.get('btn-close-viewer').addEventListener('click', () => { if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer(); });
 
-  DOMProxy.get('btn-settings-toggle')?.addEventListener('click', () => {
-    ReaderState.isSettingsOpen ? closeSettingsPanel() : openSettingsPanel();
-  });
-  DOMProxy.get('btn-settings-close')?.addEventListener('click', () => closeSettingsPanel());
+  DOMProxy.qa('[data-flow]').forEach(btn => btn.addEventListener('click', () => switchFlowMode(btn.dataset.flow)));
+  DOMProxy.get('btn-font-decrease').addEventListener('click', () => { store.fontSize = Math.max(60, store.fontSize - 5); _saveStateToLS(); });
+  DOMProxy.get('btn-font-increase').addEventListener('click', () => { store.fontSize = Math.min(200, store.fontSize + 5); _saveStateToLS(); });
+  DOMProxy.qa('[data-lh]').forEach(btn => btn.addEventListener('click', () => { store.lineHeight = btn.dataset.lh; _saveStateToLS(); }));
+  DOMProxy.qa('.theme-swatch').forEach(btn => btn.addEventListener('click', () => { store.theme = btn.dataset.theme; _saveStateToLS(); }));
 
-  DOMProxy.get('btn-close-viewer')?.addEventListener('click', () => {
-    if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer();
-  });
+  DOMProxy.get('btn-search-toggle').addEventListener('click', () => { DOMProxy.get('search-modal').style.display='flex'; setTimeout(() => DOMProxy.get('input-search-query').focus(), 60); });
+  DOMProxy.get('btn-search-modal-close').addEventListener('click', () => { DOMProxy.get('search-modal').style.display='none'; VirtualSearchList.destroy(); });
+  DOMProxy.get('btn-execute-search').addEventListener('click', runSearchExecution);
+  DOMProxy.get('input-search-query').addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearchExecution(); });
 
-  /* 설정: 보기 모드 */
-  DOMProxy.qa('[data-flow]').forEach(btn => {
-    btn.addEventListener('click', () => switchFlowMode(btn.dataset.flow));
-  });
+  DOMProxy.get('btn-stats-toggle').addEventListener('click', () => { DOMProxy.get('stats-modal').style.display='flex'; });
+  DOMProxy.get('btn-stats-modal-close').addEventListener('click', () => { DOMProxy.get('stats-modal').style.display='none'; });
+  DOMProxy.get('btn-save-goal').addEventListener('click', () => { const v=DOMProxy.get('input-reading-goal').value; if(v){localStorage.setItem('fable_daily_goal',v);Toast.show('독서 목표가 저장되었습니다.','success');} });
 
-  /* 설정: 글자 크기 */
-  DOMProxy.get('btn-font-decrease')?.addEventListener('click', () => {
-    ReadingSettings.fontSize = Math.max(60, ReadingSettings.fontSize - 5);
-    applyAllSettings();
-    saveSettings();
+  DOMProxy.get('btn-annotation-toggle').addEventListener('click', () => {
+    if (!store.rendition) return;
+    try { const doc = store.rendition.manager?.current()?.document; const text = doc?.body?.textContent?.slice(0, 4000)||''; if(text) TTSSystem.play(text); }
+    catch (_) { Toast.show('TTS를 시작할 수 없습니다.', 'error'); }
   });
-  DOMProxy.get('btn-font-increase')?.addEventListener('click', () => {
-    ReadingSettings.fontSize = Math.min(200, ReadingSettings.fontSize + 5);
-    applyAllSettings();
-    saveSettings();
-  });
+  DOMProxy.get('btn-tts-play-pause').addEventListener('click', () => TTSSystem.pauseResume());
+  DOMProxy.get('btn-tts-stop').addEventListener('click',       () => TTSSystem.stop());
+  DOMProxy.get('btn-hint-close').addEventListener('click', () => { DOMProxy.get('keyboard-hint-layer').style.display='none'; });
 
-  /* 설정: 줄간격 */
-  DOMProxy.qa('[data-lh]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      ReadingSettings.lineHeight = btn.dataset.lh;
-      applyAllSettings();
-      saveSettings();
-    });
-  });
-
-  /* 설정: 테마 스와치 */
-  DOMProxy.qa('.theme-swatch').forEach(btn => {
-    btn.addEventListener('click', () => {
-      ReadingSettings.theme = btn.dataset.theme;
-      applyAllSettings();
-      saveSettings();
-    });
-  });
-
-  /* 검색 */
-  DOMProxy.get('btn-search-toggle')?.addEventListener('click', () => {
-    const modal = DOMProxy.get('search-modal');
-    if (modal) modal.style.display = 'flex';
-    setTimeout(() => DOMProxy.get('input-search-query')?.focus(), 60);
-  });
-  DOMProxy.get('btn-search-modal-close')?.addEventListener('click', () => {
-    const modal = DOMProxy.get('search-modal');
-    if (modal) modal.style.display = 'none';
-  });
-  DOMProxy.get('btn-execute-search')?.addEventListener('click', runSearchExecution);
-  DOMProxy.get('input-search-query')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') runSearchExecution();
-  });
-
-  /* 통계 */
-  DOMProxy.get('btn-stats-toggle')?.addEventListener('click', () => {
-    const modal = DOMProxy.get('stats-modal');
-    if (modal) modal.style.display = 'flex';
-  });
-  DOMProxy.get('btn-stats-modal-close')?.addEventListener('click', () => {
-    const modal = DOMProxy.get('stats-modal');
-    if (modal) modal.style.display = 'none';
-  });
-  DOMProxy.get('btn-save-goal')?.addEventListener('click', () => {
-    const val = DOMProxy.get('input-reading-goal')?.value;
-    if (val) { localStorage.setItem('fable_daily_goal', val); Toast.show('독서 목표가 저장되었습니다.', 'success'); }
-  });
-
-  /* TTS */
-  DOMProxy.get('btn-annotation-toggle')?.addEventListener('click', () => {
-    if (!ReaderState.rendition) return;
-    try {
-      const doc  = ReaderState.rendition.manager?.current()?.document;
-      const text = doc?.body?.textContent?.slice(0, 4000) || '';
-      if (text) TTSSystem.play(text);
-    } catch (_) { Toast.show('TTS를 시작할 수 없습니다.', 'error'); }
-  });
-  DOMProxy.get('btn-tts-play-pause')?.addEventListener('click', () => TTSSystem.pauseResume());
-  DOMProxy.get('btn-tts-stop')?.addEventListener('click', () => TTSSystem.stop());
-
-  /* [UX#17] 키보드 힌트 닫기 */
-  DOMProxy.get('btn-hint-close')?.addEventListener('click', () => {
-    const layer = DOMProxy.get('keyboard-hint-layer');
-    if (layer) layer.style.display = 'none';
-  });
-
-  /* 설정 패널 외부 클릭 닫기 */
   document.addEventListener('pointerdown', (e) => {
-    const panel  = DOMProxy.get('settings-panel');
-    const btnSet = DOMProxy.get('btn-settings-toggle');
-    if (ReaderState.isSettingsOpen && panel && !panel.contains(e.target) && !btnSet?.contains(e.target)) {
-      closeSettingsPanel();
-    }
+    const panel = DOMProxy.get('settings-panel'), btn = DOMProxy.get('btn-settings-toggle');
+    if (store.isSettingsOpen && !panel.contains?.(e.target) && !btn.contains?.(e.target)) store.isSettingsOpen = false;
   }, { passive: true });
 
-  /* [UX#17] 전역 키보드 */
   document.addEventListener('keydown', handleKeyDown);
-
-  /* 폰트 업로더 */
   initFontUploader();
+  initCustomThemeBuilder();
 }
 
 /* ══════════════════════════════════════════════════════════
-   27. 설정 저장/복원
-   ══════════════════════════════════════════════════════════ */
-function saveSettings() {
-  StorageSystem.lsSet(SETTINGS_KEY, ReadingSettings);
-}
-
-function loadSettings() {
-  const saved = StorageSystem.lsGet(SETTINGS_KEY, null);
-  if (saved) Object.assign(ReadingSettings, saved);
-}
-
-/* ══════════════════════════════════════════════════════════
-   28. 전역 진입점 (initializeSystemCore)
+   §34. 전역 진입점
    ══════════════════════════════════════════════════════════ */
 async function initializeSystemCore() {
-
-  /* ── [필수 요구사항 1-1] 전역 예외 가드 (인라인 스크립트 제거분 통합) ── */
-  window.addEventListener('unhandledrejection', (event) => {
-    console.error('[Fable] Unhandled Rejection:', event.reason);
-    Toast.show('비동기 오류가 안전하게 복구되었습니다.', 'error');
+  window.addEventListener('unhandledrejection', (e) => {
+    ErrorBoundary.handle('global', e.reason ?? new Error('Unhandled rejection'), 'unhandledrejection');
   });
-
-  /* ── beforeunload: 마지막 위치 강제 저장 ── */
   window.addEventListener('beforeunload', () => {
-    if (ReaderState.bookKey && ReaderState.currentCFI) {
-      try {
-        localStorage.setItem(
-          `fable_cfi_${ReaderState.bookKey}`,
-          JSON.stringify({ data: ReaderState.currentCFI, ts: Date.now() })
-        );
-      } catch (_) {}
+    if (store.bookKey && store.currentCFI) {
+      try { localStorage.setItem('fable_cfi_' + store.bookKey, JSON.stringify({ data: store.currentCFI, ts: Date.now() })); } catch (_) {}
     }
   });
 
-  /* ── [필수 요구사항 1-1] Service Worker 등록 통합 ── */
+  ['dragenter','dragover','drop'].forEach(evt => {
+    document.addEventListener(evt, (e) => { if (!DOMProxy.get('dropzone').contains?.(e.target)) e.preventDefault(); });
+  });
+
   if ('serviceWorker' in navigator) {
     try {
       const reg = await navigator.serviceWorker.register('./sw.js');
-      console.log('[Fable] Service Worker 등록 완료:', reg.scope);
-
-      /* SW 업데이트 감지 */
+      console.log('[Fable] SW 등록 완료:', reg.scope);
       reg.addEventListener('updatefound', () => {
-        const newWorker = reg.installing;
-        newWorker?.addEventListener('statechange', () => {
-          if (newWorker.statechange === 'installed' && navigator.serviceWorker.controller) {
+        const nw = reg.installing;
+        nw?.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller)
             Toast.show('앱이 업데이트되었습니다. 새로고침하면 최신 버전을 사용할 수 있습니다.');
-          }
         });
       });
-    } catch (err) {
-      console.warn('[Fable] Service Worker 등록 실패:', err);
-    }
+    } catch (err) { console.warn('[Fable] SW 등록 실패:', err); }
   }
 
-  /* ── IndexedDB 초기화 ── */
-  await StorageSystem.init().catch(err => console.warn('[Fable] IndexedDB 초기화 실패:', err));
+  await StorageSystem.init()?.catch(err => ErrorBoundary.handle('storage', err, 'init'));
 
-  /* ── 설정 복원 ── */
-  loadSettings();
-  syncSettingsUI();
-  applyShellTheme(ReadingSettings.theme);
-
-  /* ── 전역 드래그 방지 ── */
-  ['dragenter', 'dragover', 'drop'].forEach(evt => {
-    document.addEventListener(evt, (e) => {
-      const dz = DOMProxy.get('dropzone');
-      if (dz && dz.contains(e.target)) return;
-      e.preventDefault();
-    });
-  });
-
-  /* ── UI 모듈 초기화 ── */
+  mountReactiveBinders();   /* [R1] */
+  _loadStateFromLS();
+  _forceSyncSettingsUI();
   initButtonEventHandlers();
-  initOfflineBanner();       // [UX#18]
-  initContextMenu();         // [UX#14]
-
-  /* ── 서재 렌더링 ── */
+  initOfflineBanner();     /* [UX#18] */
+  initContextMenu();       /* [UX#14] */
   renderLibraryGrid();
+  if (!('ontouchstart' in window)) showKeyboardHint(); /* [UX#17] */
 
-  /* ── [UX#17] 키보드 힌트 (PC 환경만) ── */
-  if (!('ontouchstart' in window)) {
-    showKeyboardHint();
-  }
-
-  console.log('📖 Fable v2 Premium — 초기화 완료');
+  console.log('\uD83D\uDCD6 Fable v3 — Reactive Architecture Initialized');
 }
 
-/* shell 테마 적용 (뷰어 닫힌 상태에서도 배경 일치) */
-function applyShellTheme(theme) {
-  if (theme === 'paper') { document.body.removeAttribute('data-theme'); }
-  else { document.body.setAttribute('data-theme', theme); }
+function _forceSyncSettingsUI() {
+  setTextSafe(DOMProxy.get('font-size-display'), `${store.fontSize}%`);
+  DOMProxy.qa('[data-lh]').forEach(b => { const ok = b.dataset.lh === store.lineHeight; b.classList.toggle('active',ok); b.setAttribute('aria-checked',String(ok)); });
+  DOMProxy.qa('[data-flow]').forEach(b => { const ok = b.dataset.flow === store.flow; b.classList.toggle('active',ok); b.setAttribute('aria-checked',String(ok)); });
+  DOMProxy.qa('.theme-swatch').forEach(b => { const ok = b.dataset.theme === store.theme; b.classList.toggle('active',ok); b.setAttribute('aria-checked',String(ok)); });
+  DOMProxy.get('custom-theme-builder').style.display = store.theme === 'custom' ? 'block' : 'none';
+  if (store.theme !== 'paper' && store.theme !== 'custom') document.body.setAttribute('data-theme', store.theme);
+  document.documentElement.style.setProperty('--color-user-bg',       store.userBg);
+  document.documentElement.style.setProperty('--color-user-ink',      store.userInk);
+  document.documentElement.style.setProperty('--user-letter-spacing', store.userSpacing + 'em');
+  document.documentElement.style.setProperty('--user-line-height',    String(store.userLeading));
+  DOMProxy.get('input-user-bg').value      = store.userBg;
+  DOMProxy.get('input-user-bg-hex').value  = store.userBg;
+  DOMProxy.get('input-user-ink').value     = store.userInk;
+  DOMProxy.get('input-user-ink-hex').value = store.userInk;
+  DOMProxy.get('input-user-spacing').value = String(store.userSpacing);
+  setTextSafe(DOMProxy.get('spacing-val'), store.userSpacing + 'em');
+  DOMProxy.get('input-user-leading').value = String(store.userLeading);
+  setTextSafe(DOMProxy.get('leading-val'), String(store.userLeading));
 }
 
-/* ── 전역 드래그 방지 (body 전체) ── */
-document.addEventListener('dragover', (e) => {
-  const dz = DOMProxy.get('dropzone');
-  if (!dz || !dz.contains(e.target)) e.preventDefault();
-});
-
-/* ── DOM Ready ── */
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', initializeSystemCore);
 } else {
