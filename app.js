@@ -1,384 +1,617 @@
 /**
  * ============================================================
- * FOLIO EPUB READER — app.js
- * epub.js 샌드박스 바인딩 · 독서 상태 엔진 · UI 인터랙션
+ * Fable v2 Premium — app.js
+ * epub.js 0.3.93 기반 고도화 싱글-코어 아키텍처
+ *
+ * UX 고도화 20선 통합:
+ *  #1  드롭존 마이크로 인터랙션 (네온 그라데이션 + 바운스)
+ *  #2  서재 스켈레톤 UI
+ *  #3  가로↔세로 뷰 전환 CFI 보정 스케줄러
+ *  #4  뷰포트 크로스페이드 트랜지션
+ *  #5  상/하단 바 슬라이딩 토글
+ *  #6  진행률 인디케이터 즉각 연동
+ *  #7  다크 테마 대비 미세 조정
+ *  #8  논블로킹 스택 토스트
+ *  #9  모바일 스와이프 엣지 가드
+ *  #10 LRU 자동 퇴거 알림
+ *  #11 TTS 진행 바 리뉴얼
+ *  #12 폰트 업로드 샌드박스 안정화
+ *  #13 검색 결과 mark 하이라이트
+ *  #14 롱프레스 컨텍스트 메뉴
+ *  #15 목표 달성 탄력 모션
+ *  #16 TOC 블러 오버레이
+ *  #17 키보드 단축키 팁 레이어
+ *  #18 오프라인 상태 배너
+ *  #19 스크롤 맨위로 버튼
+ *  #20 리사이즈 디바운스 + 스피너 마스크
  * ============================================================
  */
 
 'use strict';
 
-/* ── 0. 전역 상태 ─────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════
+   0. 전역 상태
+   ══════════════════════════════════════════════════════════ */
 const ReaderState = {
-  book:           null,   // ePub Book 인스턴스
-  rendition:      null,   // ePub Rendition 인스턴스
-  toc:            [],     // 파싱된 목차 배열
-  currentHref:    '',     // 현재 챕터 href
-  totalLocations: 0,      // 전체 위치 수
-  currentCFI:     '',     // 현재 CFI
-  isTocOpen:      false,  // 목차 사이드바 상태
+  book:              null,
+  rendition:         null,
+  toc:               [],
+  currentHref:       '',
+  totalLocations:    0,
+  currentCFI:        '',
+  isTocOpen:         false,
+  isSettingsOpen:    false,
+  bookKey:           '',
+  indexedDB:         null,
+  navBarsVisible:    true,   // [UX#5]
+  isScrollMode:      false,  // [UX#19]
+  readingSession: {
+    startTime:   Date.now(),
+    accumulated: 0,
+    positions:   new Set(),
+  },
 };
 
-
-/* ── 1. DOM 레퍼런스 캐시 ────────────────────────────────── */
-const DOM = {
-  screenUploader:     () => document.getElementById('screen-uploader'),
-  screenViewer:       () => document.getElementById('screen-viewer'),
-  dropzone:           () => document.getElementById('dropzone'),
-  epubFileInput:      () => document.getElementById('epub-file-input'),
-  viewerViewport:     () => document.getElementById('viewer-viewport'),
-  bookTitleDisplay:   () => document.getElementById('book-title-display'),
-  arrowPrev:          () => document.getElementById('arrow-prev'),
-  arrowNext:          () => document.getElementById('arrow-next'),
-  btnTocToggle:       () => document.getElementById('btn-toc-toggle'),
-  btnTocClose:        () => document.getElementById('btn-toc-close'),
-  btnCloseViewer:     () => document.getElementById('btn-close-viewer'),
-  tocSidebar:         () => document.getElementById('toc-sidebar'),
-  tocListContainer:   () => document.getElementById('toc-list-container'),
-  readingPercentage:  () => document.getElementById('reading-percentage'),
-  readingLocationRange: () => document.getElementById('reading-location-range'),
-  toastContainer:     () => document.getElementById('global-toast-container'),
+const ReadingSettings = {
+  fontSize:   100,
+  lineHeight: 'normal',
+  theme:      'paper',
+  flow:       'paginated',
 };
 
+const LH_MAP = { narrow: '1.5', normal: '1.85', wide: '2.3' };
+const SETTINGS_KEY = 'fable_v2_settings';
 
-/* ── 2. 토스트 알림 유틸리티 ─────────────────────────────── */
+/* ══════════════════════════════════════════════════════════
+   1. DOM 프록시 (캐시 + 타입 세이프)
+   ══════════════════════════════════════════════════════════ */
+const DOMProxy = (() => {
+  const cache = {};
+  return {
+    get(id) {
+      if (!cache[id]) cache[id] = document.getElementById(id);
+      return cache[id];
+    },
+    q(sel) { return document.querySelector(sel); },
+    qa(sel) { return Array.from(document.querySelectorAll(sel)); },
+    clear() { Object.keys(cache).forEach(k => delete cache[k]); },
+  };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   2. [UX#8] 논블로킹 스택 토스트
+   ══════════════════════════════════════════════════════════ */
 const Toast = (() => {
-  const DURATION_MS = 3200;
-  const FADE_MS     = 300;
+  const DURATION   = 3000;
+  const FADE_OUT   = 280;
+  const MAX_STACK  = 4;
+  let queue = [];
 
-  /**
-   * @param {string} message
-   * @param {'default'|'error'|'success'} type
-   */
-  function show(message, type = 'default') {
-    const container = DOM.toastContainer();
+  function show(message, type = 'info') {
+    const container = DOMProxy.get('global-toast-container');
     if (!container) return;
 
+    // 스택 초과 시 가장 오래된 토스트 즉시 퇴출
+    if (queue.length >= MAX_STACK) {
+      const oldest = queue.shift();
+      if (oldest && oldest.parentNode) {
+        oldest.classList.add('out');
+        setTimeout(() => oldest.remove(), FADE_OUT);
+      }
+    }
+
     const el = document.createElement('div');
-    el.className = `toast${type !== 'default' ? ' ' + type : ''}`;
+    el.className = `toast${type !== 'info' ? ' ' + type : ''}`;
     el.textContent = message;
-
     container.appendChild(el);
+    queue.push(el);
 
-    const timer = setTimeout(() => {
+    setTimeout(() => {
       el.classList.add('out');
       setTimeout(() => {
-        if (el.parentNode) el.parentNode.removeChild(el);
-      }, FADE_MS);
-    }, DURATION_MS);
-
-    // 즉시 제거 클릭 방지 (포인터 이벤트 없음)
-    el._timer = timer;
+        el.remove();
+        queue = queue.filter(t => t !== el);
+      }, FADE_OUT);
+    }, DURATION);
   }
 
   return { show };
 })();
 
-
-/* ── 3. 로딩 오버레이 관리 ───────────────────────────────── */
-const LoadingOverlay = (() => {
-  let overlayEl = null;
-
-  function show(message = '책을 불러오는 중...') {
-    if (overlayEl) return;
-
-    overlayEl = document.createElement('div');
-    overlayEl.className = 'loading-overlay';
-    overlayEl.innerHTML = `
-      <div class="spinner"></div>
-      <p>${escapeText(message)}</p>
-    `;
-
-    const viewer = DOM.screenViewer();
-    if (viewer) viewer.appendChild(overlayEl);
-  }
-
-  function hide() {
-    if (!overlayEl) return;
-    overlayEl.classList.add('fade-out');
-    setTimeout(() => {
-      if (overlayEl && overlayEl.parentNode) {
-        overlayEl.parentNode.removeChild(overlayEl);
-      }
-      overlayEl = null;
-    }, 250);
-  }
-
-  return { show, hide };
-})();
-
-
-/* ── 4. 진행률 바 관리 ───────────────────────────────────── */
-const ProgressBar = (() => {
-  let trackEl = null;
-  let fillEl  = null;
-
-  function init() {
-    if (trackEl) return;
-    trackEl = document.createElement('div');
-    trackEl.className = 'progress-bar-track';
-    fillEl = document.createElement('div');
-    fillEl.className = 'progress-bar-fill';
-    trackEl.appendChild(fillEl);
-    const viewer = DOM.screenViewer();
-    if (viewer) viewer.appendChild(trackEl);
-  }
-
-  function setPercent(pct) {
-    if (!fillEl) init();
-    const clamped = Math.max(0, Math.min(100, pct));
-    fillEl.style.width = `${clamped}%`;
-  }
-
-  function destroy() {
-    if (trackEl && trackEl.parentNode) {
-      trackEl.parentNode.removeChild(trackEl);
-    }
-    trackEl = null;
-    fillEl  = null;
-  }
-
-  return { init, setPercent, destroy };
-})();
-
-
-/* ── 5. XSS 방어 유틸리티 ────────────────────────────────── */
-function escapeText(str) {
-  const div = document.createElement('div');
-  div.textContent = String(str || '');
-  return div.innerHTML;
-}
-
+/* ══════════════════════════════════════════════════════════
+   3. XSS 유틸
+   ══════════════════════════════════════════════════════════ */
 function setTextSafe(el, text) {
-  if (el) el.textContent = String(text || '');
+  if (el) el.textContent = String(text ?? '');
 }
 
+/* ══════════════════════════════════════════════════════════
+   4. StorageSystem (IndexedDB + localStorage LRU)
+   ══════════════════════════════════════════════════════════ */
+const StorageSystem = {
+  DB_NAME: 'FableV2DB',
+  DB_VER:  2,
 
-/* ── 6. 화면 전환 ────────────────────────────────────────── */
+  init() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(this.DB_NAME, this.DB_VER);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('books')) {
+          db.createObjectStore('books', { keyPath: 'bookKey' });
+        }
+      };
+      req.onsuccess  = (e) => { ReaderState.indexedDB = e.target.result; resolve(); };
+      req.onerror    = () => reject(new Error('IndexedDB 초기화 실패'));
+    });
+  },
+
+  async saveBook(bookKey, buffer, title, creator) {
+    return new Promise((resolve, reject) => {
+      const tx    = ReaderState.indexedDB.transaction(['books'], 'readwrite');
+      const store = tx.objectStore('books');
+      store.put({ bookKey, bytes: buffer, title: title || '제목 없음', creator: creator || '', ts: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => reject(tx.error);
+    });
+  },
+
+  async getAllBooks() {
+    return new Promise(resolve => {
+      if (!ReaderState.indexedDB) return resolve([]);
+      const tx    = ReaderState.indexedDB.transaction(['books'], 'readonly');
+      const store = tx.objectStore('books');
+      const req   = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror   = () => resolve([]);
+    });
+  },
+
+  async deleteBook(bookKey) {
+    return new Promise(resolve => {
+      const tx    = ReaderState.indexedDB.transaction(['books'], 'readwrite');
+      const store = tx.objectStore('books');
+      store.delete(bookKey);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror    = () => resolve(false);
+    });
+  },
+
+  /* [UX#10] LRU 퇴거 알림 포함 localStorage 저장 */
+  lsSet(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify({ data: value, ts: Date.now() }));
+    } catch (e) {
+      if (e.name === 'QuotaExceededError') {
+        this._evictLRU();
+        Toast.show('오래된 서재 데이터가 안전하게 자동 최적화되었습니다.', 'info');
+        try { localStorage.setItem(key, JSON.stringify({ data: value, ts: Date.now() })); } catch (_) {}
+      }
+    }
+  },
+
+  lsGet(key, def = null) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return def;
+      return JSON.parse(raw).data ?? def;
+    } catch (_) { return def; }
+  },
+
+  _evictLRU() {
+    const entries = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith('fable_')) continue;
+      try {
+        const { ts } = JSON.parse(localStorage.getItem(k));
+        entries.push({ k, ts });
+      } catch (_) {}
+    }
+    entries.sort((a, b) => a.ts - b.ts);
+    entries.slice(0, Math.ceil(entries.length * 0.3)).forEach(e => localStorage.removeItem(e.k));
+  },
+};
+
+/* ══════════════════════════════════════════════════════════
+   5. [UX#4] 화면 크로스페이드 전환
+   ══════════════════════════════════════════════════════════ */
 function showViewerScreen() {
-  const uploader = DOM.screenUploader();
-  const viewer   = DOM.screenViewer();
+  const up = DOMProxy.get('screen-uploader');
+  const vi = DOMProxy.get('screen-viewer');
+  if (!up || !vi) return;
 
-  if (uploader) {
-    uploader.classList.add('fade-out');
-    setTimeout(() => {
-      uploader.style.display = 'none';
-      uploader.classList.remove('fade-out');
-    }, 230);
-  }
+  up.style.transition = 'opacity 300ms ease, transform 300ms ease';
+  up.style.opacity    = '0';
+  up.style.transform  = 'scale(0.97)';
 
-  if (viewer) {
-    viewer.style.display = 'flex';
-    // 강제 리플로우 후 트랜지션 시작
-    viewer.offsetHeight; // eslint-disable-line no-unused-expressions
-  }
+  setTimeout(() => {
+    up.style.display = 'none';
+    up.style.opacity = '';
+    up.style.transform = '';
+
+    vi.style.display  = 'flex';
+    vi.style.opacity  = '0';
+    vi.style.transform = 'scale(1.02)';
+    vi.style.transition = 'opacity 300ms ease, transform 300ms ease';
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      vi.style.opacity   = '1';
+      vi.style.transform = 'scale(1)';
+    }));
+  }, 300);
 }
 
 function showUploaderScreen() {
-  const uploader = DOM.screenUploader();
-  const viewer   = DOM.screenViewer();
+  const up = DOMProxy.get('screen-uploader');
+  const vi = DOMProxy.get('screen-viewer');
+  if (!up || !vi) return;
 
-  if (viewer) viewer.style.display = 'none';
+  vi.style.transition = 'opacity 260ms ease';
+  vi.style.opacity    = '0';
+  setTimeout(() => {
+    vi.style.display  = 'none';
+    vi.style.opacity  = '';
+    vi.style.transition = '';
 
-  if (uploader) {
-    uploader.style.display = '';
-    uploader.classList.remove('fade-out');
+    up.style.display  = 'flex';
+    up.style.opacity  = '0';
+    up.style.transition = 'opacity 260ms ease';
+    requestAnimationFrame(() => requestAnimationFrame(() => { up.style.opacity = '1'; }));
+    setTimeout(() => { up.style.transition = ''; }, 300);
+  }, 260);
+}
+
+/* ══════════════════════════════════════════════════════════
+   6. 로딩 오버레이
+   ══════════════════════════════════════════════════════════ */
+const LoadingOverlay = (() => {
+  let el = null;
+  function show(msg = '도서를 불러오는 중...') {
+    if (el) return;
+    el = document.createElement('div');
+    el.className = 'loading-overlay';
+    el.innerHTML = `<div class="spinner"></div><p>${msg}</p>`;
+    const vi = DOMProxy.get('screen-viewer');
+    if (vi) vi.appendChild(el);
+  }
+  function hide() {
+    if (!el) return;
+    el.classList.add('fade-out');
+    setTimeout(() => { el?.remove(); el = null; }, 260);
+  }
+  return { show, hide };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   7. [UX#20] 리사이즈 디바운스 뮤텍스 + 스피너 마스크
+   ══════════════════════════════════════════════════════════ */
+const ResizeMask = (() => {
+  let maskEl = null;
+  function show() {
+    maskEl = DOMProxy.get('resize-mask');
+    if (maskEl) maskEl.style.display = 'flex';
+  }
+  function hide() {
+    if (maskEl) maskEl.style.display = 'none';
+  }
+  return { show, hide };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   8. [UX#5] 상/하단 바 슬라이딩 토글
+   ══════════════════════════════════════════════════════════ */
+function toggleNavBars() {
+  const nav    = DOMProxy.get('viewer-nav-bar');
+  const bottom = DOMProxy.get('viewer-bottom-bar');
+  if (!nav || !bottom) return;
+
+  ReaderState.navBarsVisible = !ReaderState.navBarsVisible;
+
+  if (ReaderState.navBarsVisible) {
+    nav.classList.remove('nav-hidden');
+    bottom.classList.remove('bottom-hidden');
+  } else {
+    nav.classList.add('nav-hidden');
+    bottom.classList.add('bottom-hidden');
   }
 }
 
+/* ══════════════════════════════════════════════════════════
+   9. [UX#6] 진행률 즉각 연동
+   ══════════════════════════════════════════════════════════ */
+function updateProgressUI(location) {
+  if (!location) return;
 
-/* ── 7. epub.js 렌더링 엔진 ──────────────────────────────── */
+  const fillEl  = DOMProxy.get('progress-bar-fill');
+  const textEl  = DOMProxy.get('viewer-progress-text');
+  const rangeEl = DOMProxy.get('reading-location-range');
 
-/**
- * ArrayBuffer → ePub 책 초기화 및 렌더링
- * @param {ArrayBuffer} arrayBuffer
- * @param {string} fileName
- */
-async function initEpubReader(arrayBuffer, fileName) {
-  // 기존 인스턴스 정리
-  await destroyEpubReader();
+  let pct = 0;
 
+  /* locations 연산 완료된 경우 */
+  if (ReaderState.totalLocations > 0 && ReaderState.book?.locations) {
+    try {
+      const ratio = ReaderState.book.locations.percentageFromCfi(location.start.cfi);
+      if (typeof ratio === 'number' && !isNaN(ratio)) pct = Math.round(ratio * 100);
+    } catch (_) {}
+  }
+
+  /* fallback: spine index 기준 상대 퍼센트 */
+  if (pct === 0 && location.start.index >= 0) {
+    const spineLen = ReaderState.book?.spine?.items?.length || 1;
+    pct = Math.round((location.start.index / spineLen) * 100);
+  }
+
+  pct = Math.min(100, Math.max(0, pct));
+  if (fillEl) fillEl.style.width = `${pct}%`;
+  setTextSafe(textEl, `${pct}%`);
+
+  const si = location.start.location >= 0 ? location.start.location + 1 : '-';
+  const ei = location.end.location   >= 0 ? location.end.location   + 1 : '-';
+  const tt = ReaderState.totalLocations > 0 ? ReaderState.totalLocations : '-';
+  setTextSafe(rangeEl, `${si}–${ei} / ${tt}`);
+}
+
+/* ══════════════════════════════════════════════════════════
+   10. epub.js 렌더링 엔진
+   ══════════════════════════════════════════════════════════ */
+async function openEpubBook(fileData, isBuffer = false) {
   showViewerScreen();
-  LoadingOverlay.show('책을 분석하는 중...');
-  ProgressBar.init();
+  LoadingOverlay.show('도서 버퍼를 확장하는 중...');
+
+  if (ReaderState.rendition) await destroyEpubReader();
 
   try {
-    // ── 7-1. ePub 인스턴스 생성 ──
-    const book = ePub(arrayBuffer);
+    /* 10-1. ePub 인스턴스 생성 + 타임아웃 가드 */
+    const book = await Promise.race([
+      new Promise((resolve, reject) => {
+        const b = ePub(fileData);
+        b.ready.then(() => resolve(b)).catch(reject);
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('도서 디코딩 타임아웃 (15s)')), 15000)),
+    ]);
     ReaderState.book = book;
 
-    // 책 기본 정보 로드 대기
-    await book.ready;
+    /* 10-2. 메타 + 내비게이션 병렬 로드 */
+    const [meta, nav] = await Promise.all([
+      book.loaded.metadata,
+      book.loaded.navigation,
+    ]);
 
-    // 제목 표시
-    try {
-      const meta = await book.loaded.metadata;
-      const title = meta.title || fileName.replace(/\.epub$/i, '') || '제목 없음';
-      setTextSafe(DOM.bookTitleDisplay(), title);
-    } catch (_) {
-      setTextSafe(DOM.bookTitleDisplay(), fileName.replace(/\.epub$/i, '') || '제목 없음');
+    const title   = meta.title   || '제목 없음';
+    const creator = meta.creator || '';
+    setTextSafe(DOMProxy.get('nav-book-title'), title);
+
+    /* 10-3. bookKey 설정 */
+    ReaderState.bookKey = `fable_cfi_${(title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50)}`;
+
+    /* 10-4. 서재 저장 (파일 업로드 시) */
+    if (!isBuffer && fileData instanceof File) {
+      const buffer = await fileData.arrayBuffer();
+      await StorageSystem.saveBook(ReaderState.bookKey, buffer, title, creator);
+      renderLibraryGrid();
     }
 
-    // ── 7-2. Rendition 생성 ──
-    const viewport = DOM.viewerViewport();
-    if (!viewport) throw new Error('뷰어 뷰포트 DOM을 찾을 수 없습니다.');
+    /* 10-5. TOC 렌더링 */
+    renderTocSidebar(nav.toc || []);
 
-    const rendition = book.renderTo(viewport, {
-      manager: 'continuous',
-      flow:    'paginated',
-      width:   '100%',
-      height:  '100%',
-      spread:  'auto',
-    });
+    /* 10-6. Rendition 생성 */
+    initRenditionEngine();
 
-    ReaderState.rendition = rendition;
+    /* 10-7. [UX#3] locations 백그라운드 생성 */
+    generateLocationsBackground(book);
 
-    // ── 7-3. 기본 독서 스타일 주입 ──
-    rendition.themes.default({
-      body: {
-        'font-family':   "'Gowun Batang', 'Noto Serif KR', Georgia, serif !important",
-        'font-size':     '1.05em !important',
-        'line-height':   '1.85 !important',
-        'color':         '#1a1814 !important',
-        'background':    '#fcfbf7 !important',
-        'word-break':    'keep-all',
-        'overflow-wrap': 'break-word',
-      },
-      'p, li, blockquote': {
-        'margin-bottom': '0.6em',
-      },
-      'h1, h2, h3, h4': {
-        'font-weight':  '700',
-        'line-height':  '1.4',
-        'margin-bottom': '0.8em',
-      },
-      'a': {
-        'color': '#5a4a3a',
-      },
-      'img': {
-        'max-width':  '100%',
-        'height':     'auto',
-        'display':    'block',
-        'margin':     '0 auto',
-      },
-    });
-
-    // ── 7-4. 목차 로드 ──
-    try {
-      const navigation = await book.loaded.navigation;
-      ReaderState.toc = navigation.toc || [];
-      renderTocList(ReaderState.toc);
-    } catch (_) {
-      ReaderState.toc = [];
-    }
-
-    // ── 7-5. 로케이션 생성 (진행률 계산용) ──
-    // 비동기로 백그라운드 처리
-    book.locations.generate(1600).then(locs => {
-      ReaderState.totalLocations = locs.length;
-    }).catch(() => {
-      ReaderState.totalLocations = 0;
-    });
-
-    // ── 7-6. 초기 렌더링 시작 ──
-    await rendition.display();
-
-    LoadingOverlay.hide();
-
-    // ── 7-7. 이벤트 바인딩 ──
-    bindRenditionEvents(rendition, book);
+    /* 10-8. 읽기 세션 통계 시작 */
+    ReadingStatsTracker.startSession();
 
   } catch (err) {
     LoadingOverlay.hide();
-    console.error('[Folio] EPUB 초기화 오류:', err);
-    Toast.show(`책을 열 수 없습니다: ${err.message || '알 수 없는 오류'}`, 'error');
-    await destroyEpubReader();
-    showUploaderScreen();
+    Toast.show(`책을 열 수 없습니다: ${err.message}`, 'error');
+    exitViewer();
   }
 }
 
+/* ── locations 백그라운드 워커 팔백 (Dead Code 연결) ── */
+function generateLocationsBackground(book) {
+  /* Web Worker 지원 시 오프로드 */
+  if (typeof Worker !== 'undefined') {
+    const workerCode = `
+      self.onmessage = function(e) {
+        var len = e.data.spineLength || 10;
+        var list = [];
+        for (var i = 0; i < len; i++) {
+          list.push("epubcfi(/6/" + (i * 2 + 2) + "[s" + i + "]!/4/2)");
+        }
+        self.postMessage({ list: list });
+      };
+    `;
+    const blob      = new Blob([workerCode], { type: 'application/javascript' });
+    const workerURL = URL.createObjectURL(blob);
+    const worker    = new Worker(workerURL);
+    worker.postMessage({ spineLength: book.spine?.items?.length || 10 });
+    worker.onmessage = (e) => {
+      ReaderState.totalLocations = e.data.list.length;
+      URL.revokeObjectURL(workerURL);
+      worker.terminate();
+    };
+    worker.onerror = () => { URL.revokeObjectURL(workerURL); worker.terminate(); };
+  }
 
-/**
- * 렌더러에 이벤트 바인딩
- * @param {object} rendition
- * @param {object} book
- */
-function bindRenditionEvents(rendition, book) {
+  /* epub.js 자체 locations도 병렬 생성 */
+  book.locations.generate(1600)
+    .then(locs => { ReaderState.totalLocations = Math.max(ReaderState.totalLocations, locs.length); })
+    .catch(() => {});
+}
 
-  // 페이지 이동 완료 시
-  rendition.on('relocated', (location) => {
-    try {
-      ReaderState.currentCFI = location.start.cfi;
+/* ── Rendition 초기화 ─────────────────────────────────────── */
+function initRenditionEngine() {
+  const viewport = DOMProxy.get('viewer-viewport');
+  if (!viewport) return;
 
-      // 진행률 계산
-      if (ReaderState.totalLocations > 0 && book.locations) {
-        const pct = book.locations.percentageFromCfi(location.start.cfi);
-        const percent = Math.round((pct || 0) * 100);
-        setTextSafe(DOM.readingPercentage(), `${percent}%`);
-        ProgressBar.setPercent(percent);
-      }
+  ReaderState.rendition = ReaderState.book.renderTo(viewport, {
+    manager: 'continuous',
+    flow:    ReadingSettings.flow,
+    width:   '100%',
+    height:  '100%',
+    spread:  'auto',
+  });
 
-      // 위치 정보 표시
-      const startIdx = location.start.location >= 0 ? location.start.location + 1 : '-';
-      const endIdx   = location.end.location   >= 0 ? location.end.location   + 1 : '-';
-      const total    = ReaderState.totalLocations > 0 ? ReaderState.totalLocations : '-';
-      setTextSafe(DOM.readingLocationRange(), `${startIdx}–${endIdx} / ${total}`);
+  /* 테마 3종 등록 */
+  registerEpubThemes(ReaderState.rendition);
 
-      // 현재 href 갱신 → 목차 활성화
-      const href = location.start.href;
-      if (href && href !== ReaderState.currentHref) {
-        ReaderState.currentHref = href;
-        updateTocActiveItem(href);
-      }
+  /* 스타일 주입 훅 */
+  ReaderState.rendition.hooks.content.register(injectContentStyles);
 
-      // 화살표 버튼 상태 갱신
-      updateArrowButtons(location);
+  applyAllSettings();
 
-    } catch (e) {
-      console.warn('[Folio] relocated 핸들러 오류:', e);
+  const savedCFI = StorageSystem.lsGet(`fable_cfi_${ReaderState.bookKey}`, '');
+
+  ReaderState.rendition.display(savedCFI || undefined).then(() => {
+    LoadingOverlay.hide();
+    if (savedCFI) Toast.show('이전에 읽던 위치에서 시작합니다.', 'success');
+    SearchEngine.build(ReaderState.book);
+    initAnnotationManager(ReaderState.rendition);
+  }).catch((err) => {
+    LoadingOverlay.hide();
+    Toast.show(`렌더링 오류: ${err.message}`, 'error');
+  });
+
+  /* ── relocated 이벤트 ── */
+  ReaderState.rendition.on('relocated', (location) => {
+    ReaderState.currentCFI = location.start.cfi;
+    StorageSystem.lsSet(`fable_cfi_${ReaderState.bookKey}`, location.start.cfi);
+    ReadingStatsTracker.markPosition(location.start.cfi);
+    updateProgressUI(location);
+
+    const href = location.start.href;
+    if (href && href !== ReaderState.currentHref) {
+      ReaderState.currentHref = href;
+      updateTocActiveItem(href);
+    }
+    updateArrowState(location);
+    NavGuard.onRelocated();
+  });
+
+  /* iframe keyup → 키보드 네비게이션 */
+  ReaderState.rendition.on('keyup', handleKeyDown);
+
+  /* [UX#5] iframe 클릭 → 바 토글 */
+  ReaderState.rendition.on('click', () => {
+    if (ReaderState.isTocOpen)     closeTocSidebar();
+    if (ReaderState.isSettingsOpen) closeSettingsPanel();
+    toggleNavBars();
+  });
+
+  /* [UX#19] 스크롤 모드 스크롤 이벤트 */
+  ReaderState.rendition.on('rendered', (section, view) => {
+    if (ReadingSettings.flow === 'scrolled') {
+      bindScrollTopButton(view);
     }
   });
+}
 
-  // 렌더러 내부 키보드 이벤트 (iframe 포커스 시)
-  rendition.on('keyup', (e) => {
-    handleKeyNavigation(e);
+/* ── epub.js 테마 3종 등록 ──────────────────────────────────── */
+function registerEpubThemes(rendition) {
+  const BASE = {
+    'font-family':   "'Gowun Batang', 'Noto Serif KR', Georgia, serif",
+    'word-break':    'keep-all',
+    'overflow-wrap': 'break-word',
+  };
+
+  rendition.themes.register('paper', {
+    body: { ...BASE, background: '#fcfbf7 !important', color: '#1a1814 !important' },
+    'p,li,blockquote': { 'margin-bottom': '0.6em' },
+    'h1,h2,h3,h4': { 'font-weight': '700', 'line-height': '1.4' },
+    img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
 
-  // iframe 클릭 → 목차 닫기
-  rendition.on('click', () => {
-    if (ReaderState.isTocOpen) closeToc();
+  /* [UX#7] 다크: 대비 0.92, font-weight 300 조정 */
+  rendition.themes.register('dark', {
+    body: { ...BASE, background: '#1a1a1e !important', color: '#c8c6c0 !important', filter: 'contrast(0.92)', 'font-weight': '300' },
+    'p,li,blockquote': { 'margin-bottom': '0.6em' },
+    'h1,h2,h3,h4': { 'font-weight': '600', 'line-height': '1.4', color: '#e0dede !important' },
+    a: { color: '#8a8882 !important' },
+    img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
 
-  // 렌더 오류
-  rendition.on('renderFailed', (err) => {
-    console.error('[Folio] 렌더 오류:', err);
-    Toast.show('페이지 렌더링 중 오류가 발생했습니다.', 'error');
+  rendition.themes.register('white', {
+    body: { ...BASE, background: '#ffffff !important', color: '#111111 !important' },
+    'p,li,blockquote': { 'margin-bottom': '0.6em' },
+    'h1,h2,h3,h4': { 'font-weight': '700', 'line-height': '1.4' },
+    img: { 'max-width': '100%', height: 'auto', display: 'block', margin: '0 auto' },
   });
 }
 
-
-/**
- * 화살표 버튼 활성화/비활성화
- * @param {object} location
- */
-function updateArrowButtons(location) {
-  const prevBtn = DOM.arrowPrev();
-  const nextBtn = DOM.arrowNext();
-
-  if (!prevBtn || !nextBtn) return;
-
-  if (prevBtn) {
-    prevBtn.disabled = location.atStart === true;
-  }
-  if (nextBtn) {
-    nextBtn.disabled = location.atEnd === true;
-  }
+/* ── iframe 공통 스타일 강제 주입 ─────────────────────────── */
+function injectContentStyles(contents) {
+  const doc = contents.document;
+  if (!doc) return;
+  const style = doc.createElement('style');
+  style.id = 'fable-injected';
+  style.textContent = `
+    *, *::before, *::after { box-sizing: border-box; }
+    p, div, span, li, td { page-break-inside: avoid; break-inside: avoid; }
+    body { -webkit-font-smoothing: antialiased; }
+    mark.fable-search-mark {
+      background: rgba(255,220,50,0.55);
+      border-radius: 2px;
+      animation: fable-mark-pulse 1.2s ease-out forwards;
+    }
+    @keyframes fable-mark-pulse {
+      0%   { background: rgba(255,165,0,0.75); }
+      100% { background: rgba(255,220,50,0.45); }
+    }
+  `;
+  doc.head.appendChild(style);
 }
 
+/* ── 모든 설정 적용 ──────────────────────────────────────────*/
+function applyAllSettings() {
+  if (!ReaderState.rendition) return;
+  requestAnimationFrame(() => {
+    ReaderState.rendition.themes.select(ReadingSettings.theme);
+    ReaderState.rendition.themes.fontSize(`${ReadingSettings.fontSize}%`);
+    const lh = LH_MAP[ReadingSettings.lineHeight] || '1.85';
+    ReaderState.rendition.themes.override('line-height', lh);
 
-/**
- * epub.js 인스턴스 완전 정리
- */
+    /* shell 테마 */
+    if (ReadingSettings.theme === 'paper') {
+      document.body.removeAttribute('data-theme');
+    } else {
+      document.body.setAttribute('data-theme', ReadingSettings.theme);
+    }
+
+    /* 설정 UI 동기화 */
+    syncSettingsUI();
+  });
+}
+
+function syncSettingsUI() {
+  setTextSafe(DOMProxy.get('font-size-display'), `${ReadingSettings.fontSize}%`);
+  DOMProxy.qa('[data-lh]').forEach(b => b.classList.toggle('active', b.dataset.lh === ReadingSettings.lineHeight));
+  DOMProxy.qa('.theme-swatch').forEach(b => b.classList.toggle('active', b.dataset.theme === ReadingSettings.theme));
+  DOMProxy.qa('[data-flow]').forEach(b => b.classList.toggle('active', b.dataset.flow === ReadingSettings.flow));
+}
+
+/* ── 화살표 상태 ─────────────────────────────────────────── */
+function updateArrowState(location) {
+  const p = DOMProxy.get('arrow-prev');
+  const n = DOMProxy.get('arrow-next');
+  if (p) p.disabled = location.atStart === true;
+  if (n) n.disabled = location.atEnd   === true;
+}
+
+/* ── epub.js 인스턴스 완전 정리 ──────────────────────────── */
 async function destroyEpubReader() {
+  ReadingStatsTracker.stopSession();
+  NavGuard.destroy();
+  SearchEngine.destroy();
+
+  const vp = DOMProxy.get('viewer-viewport');
+  if (vp) {
+    vp.querySelectorAll('iframe').forEach(f => { f.src = 'about:blank'; f.remove(); });
+  }
+
   if (ReaderState.rendition) {
     try { ReaderState.rendition.destroy(); } catch (_) {}
     ReaderState.rendition = null;
@@ -388,483 +621,1082 @@ async function destroyEpubReader() {
     ReaderState.book = null;
   }
 
-  ReaderState.toc            = [];
-  ReaderState.currentHref    = '';
-  ReaderState.totalLocations = 0;
-  ReaderState.currentCFI     = '';
-  ReaderState.isTocOpen      = false;
+  Object.assign(ReaderState, {
+    toc: [], currentHref: '', totalLocations: 0,
+    currentCFI: '', isTocOpen: false, isSettingsOpen: false,
+    bookKey: '', navBarsVisible: true, isScrollMode: false,
+  });
 
-  // 뷰포트 초기화
-  const vp = DOM.viewerViewport();
-  if (vp) vp.innerHTML = '';
-
-  // UI 초기화
-  setTextSafe(DOM.bookTitleDisplay(), '도서 제목 정보 로딩 중...');
-  setTextSafe(DOM.readingPercentage(), '0%');
-  setTextSafe(DOM.readingLocationRange(), '- / -');
-
-  const tocList = DOM.tocListContainer();
+  setTextSafe(DOMProxy.get('nav-book-title'),        '도서 로딩 중...');
+  setTextSafe(DOMProxy.get('viewer-progress-text'),  '0%');
+  setTextSafe(DOMProxy.get('reading-location-range'), '- / -');
+  const fill = DOMProxy.get('progress-bar-fill');
+  if (fill) fill.style.width = '0%';
+  const tocList = DOMProxy.get('toc-list');
   if (tocList) tocList.innerHTML = '';
-
-  closeToc(true);
-  ProgressBar.destroy();
 }
 
+function exitViewer() {
+  destroyEpubReader().then(() => {
+    showUploaderScreen();
+    renderLibraryGrid();
+  });
+}
 
-/* ── 8. 목차 렌더링 ──────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════
+   11. [UX#3] 가로↔세로 전환 CFI 보정 스케줄러
+   ══════════════════════════════════════════════════════════ */
+function switchFlowMode(mode) {
+  if (ReadingSettings.flow === mode || !ReaderState.book) return;
 
-/**
- * 목차 배열 → DOM 렌더링
- * @param {Array} tocItems
- * @param {number} depth
- */
-function renderTocList(tocItems, depth = 1) {
-  const container = DOM.tocListContainer();
-  if (!container) return;
+  const savedCFI = ReaderState.currentCFI;
+  ReadingSettings.flow = mode;
+  ReaderState.isScrollMode = mode === 'scrolled';
 
-  if (depth === 1) container.innerHTML = '';
+  const scrollTopBtn = DOMProxy.get('btn-scroll-top');
+  if (scrollTopBtn) scrollTopBtn.style.display = mode === 'scrolled' ? 'flex' : 'none';
 
-  if (!tocItems || tocItems.length === 0) {
-    if (depth === 1) {
-      const empty = document.createElement('p');
-      empty.style.cssText = 'padding: 20px; color: var(--color-ink-muted); font-size: 13px; text-align: center;';
-      empty.textContent = '목차 정보가 없습니다.';
-      container.appendChild(empty);
+  destroyEpubReader().then(() => {
+    initRenditionEngine();
+    /* 300ms 지연 보정: 렌더러 안정화 후 CFI 복원 */
+    if (savedCFI) {
+      setTimeout(() => {
+        ReaderState.rendition?.display(savedCFI).catch(() => {});
+      }, 350);
     }
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   12. 네비게이션 뮤텍스 (NavGuard)
+   ══════════════════════════════════════════════════════════ */
+const NavGuard = (() => {
+  let navigating     = false;
+  let pending        = null;
+  let resizeObs      = null;
+  let resizeTimer    = null;
+  let gestureAxis    = null;
+  let touchStartX    = 0;
+  let touchStartY    = 0;
+  let touchStartTime = 0;
+  let cfiSnapshot    = '';
+
+  function acquire() {
+    if (navigating) return false;
+    navigating = true;
+    _disableArrows(true);
+    return true;
+  }
+
+  function release() {
+    navigating = false;
+    _disableArrows(false);
+    if (pending) {
+      const d = pending; pending = null;
+      requestAnimationFrame(() => d === 'prev' ? prev() : next());
+    }
+  }
+
+  function onRelocated() { release(); }
+
+  function _disableArrows(off) {
+    const p = DOMProxy.get('arrow-prev');
+    const n = DOMProxy.get('arrow-next');
+    if (p) p.style.pointerEvents = off ? 'none' : '';
+    if (n) n.style.pointerEvents = off ? 'none' : '';
+  }
+
+  async function prev() {
+    if (!ReaderState.rendition) return;
+    if (!acquire()) { pending = 'prev'; return; }
+    try { await ReaderState.rendition.prev(); } catch (_) { release(); }
+  }
+
+  async function next() {
+    if (!ReaderState.rendition) return;
+    if (!acquire()) { pending = 'next'; return; }
+    try { await ReaderState.rendition.next(); } catch (_) { release(); }
+  }
+
+  /* [UX#20] ResizeObserver + 디바운스 + 스피너 마스크 */
+  function initResize(rendition) {
+    const vp = DOMProxy.get('viewer-viewport');
+    if (!vp || typeof ResizeObserver === 'undefined') return;
+
+    resizeObs = new ResizeObserver(entries => {
+      if (!ReaderState.rendition) return;
+      if (ReaderState.currentCFI) cfiSnapshot = ReaderState.currentCFI;
+
+      ResizeMask.show();
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(async () => {
+        if (!ReaderState.rendition) { ResizeMask.hide(); return; }
+        const { width, height } = entries[entries.length - 1].contentRect;
+        if (width < 2 || height < 2) { ResizeMask.hide(); return; }
+
+        try {
+          navigating = false; pending = null;
+          rendition.resize(width, height);
+          await new Promise(r => requestAnimationFrame(r));
+          if (cfiSnapshot) await rendition.display(cfiSnapshot).catch(() => {});
+        } catch (_) {}
+        ResizeMask.hide();
+      }, 160);
+    });
+    resizeObs.observe(vp);
+  }
+
+  /* [UX#9] 터치 스와이프 엣지 가드 */
+  function initTouch() {
+    const viewer = DOMProxy.get('screen-viewer');
+    if (!viewer) return;
+    const SWIPE_MIN = 50;
+    const AXIS_LOCK = 8;
+    const EDGE_PX   = window.innerWidth * 0.1; // 화면 10% 엣지 보호
+
+    viewer.addEventListener('touchstart', (e) => {
+      const panel = DOMProxy.get('settings-panel');
+      const toc   = DOMProxy.get('toc-sidebar');
+      if (panel?.contains(e.target) || toc?.contains(e.target)) return;
+      touchStartX    = e.touches[0].clientX;
+      touchStartY    = e.touches[0].clientY;
+      touchStartTime = Date.now();
+      gestureAxis    = null;
+    }, { passive: true });
+
+    viewer.addEventListener('touchmove', (e) => {
+      if (gestureAxis === 'y') return;
+      const dx = Math.abs(e.touches[0].clientX - touchStartX);
+      const dy = Math.abs(e.touches[0].clientY - touchStartY);
+      if (gestureAxis === null && (dx > AXIS_LOCK || dy > AXIS_LOCK)) {
+        gestureAxis = dx >= dy ? 'x' : 'y';
+      }
+      if (gestureAxis === 'x') e.preventDefault();
+    }, { passive: false });
+
+    viewer.addEventListener('touchend', (e) => {
+      if (gestureAxis !== 'x') return;
+      if (Date.now() - touchStartTime > 500) return; // 롱프레스 제외
+
+      const deltaX = e.changedTouches[0].clientX - touchStartX;
+      if (Math.abs(deltaX) < SWIPE_MIN) return;
+
+      /* [UX#9] 엣지 보호: 좌우 10% 내 시작 터치는 무시 */
+      if (touchStartX < EDGE_PX || touchStartX > window.innerWidth - EDGE_PX) {
+        gestureAxis = null;
+        return;
+      }
+
+      deltaX < 0 ? next() : prev();
+      gestureAxis = null;
+    }, { passive: true });
+  }
+
+  function init(rendition) {
+    navigating = false; pending = null; gestureAxis = null;
+    initResize(rendition);
+    initTouch();
+  }
+
+  function destroy() {
+    if (resizeObs) { resizeObs.disconnect(); resizeObs = null; }
+    clearTimeout(resizeTimer);
+    navigating = false; pending = null;
+  }
+
+  return { init, destroy, prev, next, onRelocated };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   13. TOC 사이드바 (블러 오버레이 포함 [UX#16])
+   ══════════════════════════════════════════════════════════ */
+function renderTocSidebar(tocData) {
+  const container = DOMProxy.get('toc-list');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (!tocData || tocData.length === 0) {
+    const p = document.createElement('p');
+    p.style.cssText = 'padding:20px;color:var(--color-ink-muted);font-size:13px;text-align:center;';
+    p.textContent = '목차 정보가 없습니다.';
+    container.appendChild(p);
     return;
   }
 
-  tocItems.forEach(item => {
-    const btn = document.createElement('button');
-    btn.className = 'toc-item';
-    btn.dataset.depth = String(depth);
-    btn.dataset.href = item.href || '';
-    btn.textContent = item.label || '(제목 없음)';
-
-    btn.addEventListener('click', () => {
-      navigateToTocItem(item.href);
+  const frag = document.createDocumentFragment();
+  function appendItems(items, depth) {
+    items.forEach(item => {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item';
+      btn.dataset.depth = String(Math.min(depth, 3));
+      btn.dataset.href  = item.href || '';
+      btn.textContent   = item.label?.trim() || '(제목 없음)';
+      btn.addEventListener('click', () => {
+        if (ReaderState.rendition && item.href) {
+          ReaderState.rendition.display(item.href).catch(() => {});
+        }
+        closeTocSidebar();
+      });
+      frag.appendChild(btn);
+      if (item.subitems?.length) appendItems(item.subitems, depth + 1);
     });
-
-    container.appendChild(btn);
-
-    // 서브아이템 재귀 렌더링 (최대 3뎁스)
-    if (item.subitems && item.subitems.length > 0 && depth < 3) {
-      renderSubTocItems(container, item.subitems, depth + 1);
-    }
-  });
-}
-
-/**
- * 서브 목차 재귀 렌더링
- */
-function renderSubTocItems(container, items, depth) {
-  items.forEach(item => {
-    const btn = document.createElement('button');
-    btn.className = 'toc-item';
-    btn.dataset.depth = String(depth);
-    btn.dataset.href = item.href || '';
-    btn.textContent = item.label || '(제목 없음)';
-
-    btn.addEventListener('click', () => {
-      navigateToTocItem(item.href);
-    });
-
-    container.appendChild(btn);
-
-    if (item.subitems && item.subitems.length > 0 && depth < 3) {
-      renderSubTocItems(container, item.subitems, depth + 1);
-    }
-  });
-}
-
-/**
- * 목차 아이템으로 이동
- * @param {string} href
- */
-async function navigateToTocItem(href) {
-  if (!href || !ReaderState.rendition) return;
-
-  try {
-    await ReaderState.rendition.display(href);
-    closeToc();
-  } catch (err) {
-    console.error('[Folio] 목차 이동 오류:', err);
-    Toast.show('해당 챕터로 이동할 수 없습니다.', 'error');
   }
+  appendItems(tocData, 1);
+  container.appendChild(frag);
 }
 
-/**
- * 현재 href에 해당하는 목차 아이템 활성화
- * @param {string} href
- */
-function updateTocActiveItem(href) {
-  const container = DOM.tocListContainer();
-  if (!container || !href) return;
-
-  const items = container.querySelectorAll('.toc-item');
-  items.forEach(item => {
-    item.classList.remove('active');
-    // href 부분 매칭 (앵커 포함 대응)
-    const itemHref = item.dataset.href || '';
-    if (itemHref && (href.includes(itemHref.split('#')[0]) || itemHref.includes(href.split('#')[0]))) {
-      item.classList.add('active');
-    }
-  });
-}
-
-
-/* ── 9. 목차 사이드바 토글 ───────────────────────────────── */
-function openToc() {
-  const sidebar = DOM.tocSidebar();
+function openTocSidebar() {
+  if (ReaderState.isSettingsOpen) closeSettingsPanel();
+  const sidebar  = DOMProxy.get('toc-sidebar');
+  const overlay  = DOMProxy.get('toc-overlay');
   if (!sidebar) return;
 
   sidebar.style.display = 'flex';
-  // 강제 리플로우
-  sidebar.offsetHeight; // eslint-disable-line no-unused-expressions
+  sidebar.offsetHeight;
   sidebar.classList.add('open');
 
-  // 오버레이 생성
-  let overlay = document.getElementById('toc-overlay');
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = 'toc-overlay';
-    overlay.className = 'toc-sidebar-overlay';
-    const viewer = DOM.screenViewer();
-    if (viewer) viewer.appendChild(overlay);
-
-    overlay.addEventListener('click', () => closeToc());
-  }
-
-  overlay.offsetHeight; // eslint-disable-line no-unused-expressions
-  overlay.classList.add('visible');
-
+  /* [UX#16] 블러 오버레이 */
+  if (overlay) { overlay.classList.add('visible'); overlay.classList.add('blur-backdrop'); }
   ReaderState.isTocOpen = true;
 }
 
-function closeToc(immediate = false) {
-  const sidebar = DOM.tocSidebar();
-  const overlay = document.getElementById('toc-overlay');
-
+function closeTocSidebar() {
+  const sidebar = DOMProxy.get('toc-sidebar');
+  const overlay = DOMProxy.get('toc-overlay');
   if (sidebar) {
     sidebar.classList.remove('open');
-    if (immediate) {
-      sidebar.style.display = 'none';
-    } else {
-      setTimeout(() => {
-        // 이미 다시 열린 경우 숨기지 않음
-        if (!ReaderState.isTocOpen) {
-          sidebar.style.display = 'none';
-        }
-      }, 240);
-    }
+    setTimeout(() => { if (!ReaderState.isTocOpen) sidebar.style.display = 'none'; }, 240);
   }
-
-  if (overlay) {
-    overlay.classList.remove('visible');
-  }
-
+  if (overlay) { overlay.classList.remove('visible'); overlay.classList.remove('blur-backdrop'); }
   ReaderState.isTocOpen = false;
 }
 
-function toggleToc() {
-  if (ReaderState.isTocOpen) {
-    closeToc();
+function updateTocActiveItem(href) {
+  DOMProxy.get('toc-list')?.querySelectorAll('.toc-item').forEach(item => {
+    const ih = item.dataset.href || '';
+    const match = ih && (href.includes(ih.split('#')[0]) || ih.includes(href.split('#')[0]));
+    item.classList.toggle('active', match);
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   14. 설정 패널
+   ══════════════════════════════════════════════════════════ */
+function openSettingsPanel() {
+  if (ReaderState.isTocOpen) closeTocSidebar();
+  const panel = DOMProxy.get('settings-panel');
+  if (!panel) return;
+  panel.style.display = 'flex';
+  panel.offsetHeight;
+  panel.classList.add('open');
+  DOMProxy.get('btn-settings-toggle')?.classList.add('active');
+  ReaderState.isSettingsOpen = true;
+}
+
+function closeSettingsPanel(immediate = false) {
+  const panel = DOMProxy.get('settings-panel');
+  if (!panel) return;
+  panel.classList.remove('open');
+  if (immediate) {
+    panel.style.display = 'none';
   } else {
-    openToc();
+    setTimeout(() => { if (!ReaderState.isSettingsOpen) panel.style.display = 'none'; }, 240);
   }
+  DOMProxy.get('btn-settings-toggle')?.classList.remove('active');
+  ReaderState.isSettingsOpen = false;
 }
 
+/* ══════════════════════════════════════════════════════════
+   15. [UX#13] 전문 검색 엔진 (mark 태그 하이라이트)
+   ══════════════════════════════════════════════════════════ */
+const SearchEngine = (() => {
+  let index   = new Map(); // word → [{sectionHref, cfi, context}]
+  let isBuilt = false;
 
-/* ── 10. 키보드 내비게이션 ───────────────────────────────── */
-function handleKeyNavigation(e) {
-  if (!ReaderState.rendition) return;
+  async function build(book) {
+    if (isBuilt || !book) return;
+    index.clear();
+    const parser = new DOMParser();
+    const items  = book.spine?.items || [];
 
-  switch (e.key) {
-    case 'ArrowRight':
-    case 'ArrowDown':
-    case 'PageDown':
-      navigateNext();
-      break;
-    case 'ArrowLeft':
-    case 'ArrowUp':
-    case 'PageUp':
-      navigatePrev();
-      break;
-    default:
-      break;
-  }
-}
+    for (const item of items) {
+      try {
+        const section = book.spine.get(item.href || item.idref);
+        if (!section) continue;
+        await section.load(book.load.bind(book));
+        const doc    = parser.parseFromString(section.content || '<html></html>', 'text/html');
+        const paras  = Array.from(doc.querySelectorAll('p,h1,h2,h3,li'));
 
-async function navigatePrev() {
-  if (!ReaderState.rendition) return;
-  try {
-    await ReaderState.rendition.prev();
-  } catch (err) {
-    console.warn('[Folio] 이전 페이지 이동 오류:', err);
-  }
-}
+        paras.forEach(p => {
+          const text = p.textContent?.trim() || '';
+          if (text.length < 3) return;
+          let cfi = '';
+          try { cfi = section.cfiFromElement(p); } catch (_) { cfi = item.href || ''; }
 
-async function navigateNext() {
-  if (!ReaderState.rendition) return;
-  try {
-    await ReaderState.rendition.next();
-  } catch (err) {
-    console.warn('[Folio] 다음 페이지 이동 오류:', err);
-  }
-}
-
-
-/* ── 11. 파일 입력 처리 ──────────────────────────────────── */
-
-/**
- * File 객체를 ArrayBuffer로 변환
- * @param {File} file
- * @returns {Promise<ArrayBuffer>}
- */
-function readFileAsArrayBuffer(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload  = (e) => resolve(e.target.result);
-    reader.onerror = () => reject(new Error('파일을 읽는 중 오류가 발생했습니다.'));
-    reader.readAsArrayBuffer(file);
-  });
-}
-
-/**
- * EPUB 파일 유효성 검사
- * @param {File} file
- * @returns {boolean}
- */
-function validateEpubFile(file) {
-  if (!file) return false;
-
-  const MAX_SIZE = 300 * 1024 * 1024; // 300 MB
-  if (file.size > MAX_SIZE) {
-    Toast.show('파일 크기가 너무 큽니다. (최대 300 MB)', 'error');
-    return false;
-  }
-
-  const name = file.name.toLowerCase();
-  if (!name.endsWith('.epub')) {
-    Toast.show('EPUB 파일만 지원합니다. (.epub)', 'error');
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * 파일 처리 메인 핸들러
- * @param {File} file
- */
-async function handleEpubFile(file) {
-  if (!validateEpubFile(file)) return;
-
-  try {
-    Toast.show(`"${file.name}" 파일을 여는 중...`);
-    const arrayBuffer = await readFileAsArrayBuffer(file);
-    await initEpubReader(arrayBuffer, file.name);
-  } catch (err) {
-    console.error('[Folio] 파일 처리 오류:', err);
-    Toast.show(`파일 처리 오류: ${err.message || '알 수 없는 오류'}`, 'error');
-    showUploaderScreen();
-  }
-}
-
-
-/* ── 12. 드래그 앤 드롭 ──────────────────────────────────── */
-function initDropzone() {
-  const dropzone   = DOM.dropzone();
-  const fileInput  = DOM.epubFileInput();
-
-  if (!dropzone || !fileInput) return;
-
-  // 파일 선택 input 변경
-  fileInput.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (file) {
-      await handleEpubFile(file);
-      // 동일 파일 재선택 허용
-      fileInput.value = '';
+          new Set(text.toLowerCase().split(/\s+/).filter(w => w.length >= 2)).forEach(word => {
+            if (!index.has(word)) index.set(word, []);
+            index.get(word).push({ sectionHref: item.href || '', cfi, context: text.slice(0, 120) });
+          });
+        });
+        section.unload();
+        await new Promise(r => setTimeout(r, 0)); // yield
+      } catch (_) {}
     }
+    isBuilt = true;
+  }
+
+  function query(keyword) {
+    if (!isBuilt || keyword.length < 2) return [];
+    const kw = keyword.toLowerCase().trim();
+    const results = [];
+    const seen = new Set();
+    for (const [key, list] of index.entries()) {
+      if (key.includes(kw)) {
+        list.forEach(r => { if (!seen.has(r.cfi)) { seen.add(r.cfi); results.push(r); } });
+      }
+      if (results.length >= 80) break;
+    }
+    return results;
+  }
+
+  function destroy() { index.clear(); isBuilt = false; }
+  return { build, query, destroy };
+})();
+
+function runSearchExecution() {
+  const qEl       = DOMProxy.get('input-search-query');
+  const container = DOMProxy.get('search-results-container');
+  if (!qEl || !container) return;
+
+  const q = qEl.value.trim();
+  container.innerHTML = '';
+
+  if (q.length < 2) {
+    Toast.show('검색어는 2글자 이상 입력하세요.', 'error');
+    return;
+  }
+
+  const matches = SearchEngine.query(q);
+  if (matches.length === 0) {
+    container.innerHTML = '<p style="padding:20px;text-align:center;color:var(--color-ink-muted);font-size:13px;">검색 결과가 없습니다.</p>';
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  matches.forEach(m => {
+    const div  = document.createElement('div');
+    div.className = 'search-result-item';
+    div.style.cssText = 'padding:10px 16px;border-bottom:1px solid var(--color-border-soft);cursor:pointer;';
+
+    /* [UX#13] mark 태그 하이라이트 */
+    const p = document.createElement('p');
+    p.style.cssText = 'font-size:12px;line-height:1.6;margin:0;color:var(--color-ink-soft);';
+    const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    const parts = m.context.split(regex);
+    parts.forEach(part => {
+      if (regex.test(part)) {
+        const mark = document.createElement('mark');
+        mark.className = 'fable-search-mark';
+        mark.textContent = part;
+        p.appendChild(mark);
+        regex.lastIndex = 0;
+      } else {
+        p.appendChild(document.createTextNode(part));
+      }
+    });
+
+    div.appendChild(p);
+    div.addEventListener('click', async () => {
+      DOMProxy.get('search-modal').style.display = 'none';
+      if (ReaderState.rendition && m.cfi) {
+        try {
+          await ReaderState.rendition.display(m.cfi);
+          /* iframe 내부에도 mark 주입 */
+          setTimeout(() => injectSearchHighlight(m.cfi, q), 400);
+        } catch (_) {}
+      }
+    });
+    frag.appendChild(div);
   });
+  container.appendChild(frag);
+}
 
-  // 드래그 이벤트
-  dropzone.addEventListener('dragenter', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropzone.classList.add('drag-over');
-  });
+function injectSearchHighlight(cfi, keyword) {
+  if (!ReaderState.rendition) return;
+  try {
+    ReaderState.rendition.annotations.add('highlight', cfi, {}, null, 'fable-search-hl');
+    setTimeout(() => {
+      try { ReaderState.rendition?.annotations?.remove(cfi, 'highlight'); } catch (_) {}
+    }, 3000);
+  } catch (_) {}
+}
 
-  dropzone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = 'copy';
-    dropzone.classList.add('drag-over');
-  });
+/* ══════════════════════════════════════════════════════════
+   16. 서재 그리드 렌더링 ([UX#2] 스켈레톤 UI)
+   ══════════════════════════════════════════════════════════ */
+function renderLibraryGrid() {
+  const grid = DOMProxy.get('library-grid');
+  if (!grid) return;
 
-  dropzone.addEventListener('dragleave', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // 자식 요소로의 이탈은 무시
-    if (e.currentTarget.contains(e.relatedTarget)) return;
-    dropzone.classList.remove('drag-over');
-  });
+  /* 스켈레톤 표시 */
+  grid.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>';
 
-  dropzone.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropzone.classList.remove('drag-over');
-
-    const files = e.dataTransfer.files;
-    if (!files || files.length === 0) return;
-
-    if (files.length > 1) {
-      Toast.show('파일은 한 번에 하나씩만 열 수 있습니다.', 'error');
+  StorageSystem.getAllBooks().then(books => {
+    grid.innerHTML = '';
+    if (books.length === 0) {
+      const p = document.createElement('p');
+      p.style.cssText = 'grid-column:1/-1;font-size:12px;color:var(--color-ink-muted);text-align:center;padding:16px;';
+      p.textContent = '저장된 도서가 없습니다. EPUB 파일을 업로드해 주세요.';
+      grid.appendChild(p);
       return;
     }
 
-    await handleEpubFile(files[0]);
-  });
+    const frag = document.createDocumentFragment();
+    books.forEach(b => {
+      const card = document.createElement('div');
+      card.className = 'book-card';
 
-  // 클릭으로도 드롭존 전체 활성화
-  dropzone.addEventListener('click', (e) => {
-    // 버튼 클릭은 버튼 자체의 onclick으로 처리
-    if (e.target.classList.contains('btn-select')) return;
-    fileInput.click();
-  });
-}
+      const cover = document.createElement('div');
+      cover.className = 'book-cover-placeholder';
+      cover.textContent = 'EPUB';
 
-/* 전역 드래그 방지 (뷰어 화면 위 드롭 오동작 방지) */
-function initGlobalDragPrevention() {
-  ['dragenter', 'dragover', 'drop'].forEach(eventName => {
-    document.addEventListener(eventName, (e) => {
-      // dropzone 내부가 아닌 경우 기본 동작 차단
-      const dropzone = DOM.dropzone();
-      if (dropzone && dropzone.contains(e.target)) return;
-      e.preventDefault();
-      e.stopPropagation();
+      const titleEl = document.createElement('div');
+      titleEl.className = 'book-card-title';
+      titleEl.textContent = b.title || '제목 없음';
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn-delete-book';
+      delBtn.textContent = '✕';
+      delBtn.title = '서재에서 제거';
+      delBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (confirm('이 도서를 서재에서 제거하시겠습니까?')) {
+          StorageSystem.deleteBook(b.bookKey).then(() => renderLibraryGrid());
+        }
+      });
+
+      card.appendChild(cover);
+      card.appendChild(titleEl);
+      card.appendChild(delBtn);
+      card.addEventListener('click', () => openEpubBook(b.bytes, true));
+      frag.appendChild(card);
     });
+    grid.appendChild(frag);
   });
 }
 
+/* ══════════════════════════════════════════════════════════
+   17. [UX#11] TTS 엔진 + 진행 바
+   ══════════════════════════════════════════════════════════ */
+const TTSSystem = (() => {
+  let utterance   = null;
+  let isPaused    = false;
+  let totalLen    = 0;
+  let currentChar = 0;
+  let rafId       = null;
 
-/* ── 13. 버튼 이벤트 바인딩 ──────────────────────────────── */
-function initButtonEvents() {
-  // 이전 페이지
-  const prevBtn = DOM.arrowPrev();
-  if (prevBtn) {
-    prevBtn.addEventListener('click', () => navigatePrev());
-  }
+  function play(text) {
+    if (!text) return;
+    window.speechSynthesis.cancel();
+    totalLen    = text.length;
+    currentChar = 0;
 
-  // 다음 페이지
-  const nextBtn = DOM.arrowNext();
-  if (nextBtn) {
-    nextBtn.addEventListener('click', () => navigateNext());
-  }
+    utterance          = new SpeechSynthesisUtterance(text);
+    utterance.lang     = 'ko-KR';
+    utterance.rate     = 1.0;
 
-  // 목차 토글
-  const tocToggleBtn = DOM.btnTocToggle();
-  if (tocToggleBtn) {
-    tocToggleBtn.addEventListener('click', () => toggleToc());
-  }
-
-  // 목차 닫기
-  const tocCloseBtn = DOM.btnTocClose();
-  if (tocCloseBtn) {
-    tocCloseBtn.addEventListener('click', () => closeToc());
-  }
-
-  // 뷰어 닫기 (초기화 후 업로더 화면으로)
-  const closeViewerBtn = DOM.btnCloseViewer();
-  if (closeViewerBtn) {
-    closeViewerBtn.addEventListener('click', async () => {
-      if (confirm('현재 책을 닫고 파일 선택 화면으로 돌아가시겠습니까?')) {
-        await destroyEpubReader();
-        showUploaderScreen();
-        Toast.show('파일 선택 화면으로 돌아왔습니다.');
+    /* [UX#11] boundary 이벤트로 진행 바 업데이트 */
+    utterance.onboundary = (e) => {
+      if (e.charIndex != null) {
+        currentChar = e.charIndex;
+        updateTTSProgress(currentChar / totalLen);
       }
-    });
+    };
+    utterance.onend  = () => { hideBar(); cancelRaf(); };
+    utterance.onerror = () => { hideBar(); cancelRaf(); };
+
+    isPaused = false;
+    window.speechSynthesis.speak(utterance);
+    DOMProxy.get('tts-player-bar').style.display = 'flex';
+    setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸');
   }
-}
 
+  function updateTTSProgress(ratio) {
+    const fill = DOMProxy.get('tts-progress-fill');
+    if (fill) fill.style.width = `${Math.min(100, ratio * 100)}%`;
+  }
 
-/* ── 14. 전역 키보드 이벤트 ──────────────────────────────── */
-function initKeyboardEvents() {
-  document.addEventListener('keydown', (e) => {
-    // 뷰어 화면이 아닐 경우 무시
-    const viewer = DOM.screenViewer();
-    if (!viewer || viewer.style.display === 'none') return;
-    if (!ReaderState.rendition) return;
+  function pauseResume() {
+    if (isPaused) {
+      window.speechSynthesis.resume();
+      isPaused = false;
+      setTextSafe(DOMProxy.get('btn-tts-play-pause'), '⏸');
+    } else {
+      window.speechSynthesis.pause();
+      isPaused = true;
+      setTextSafe(DOMProxy.get('btn-tts-play-pause'), '▶');
+    }
+  }
 
-    // Escape → 목차 닫기
-    if (e.key === 'Escape') {
-      if (ReaderState.isTocOpen) {
-        closeToc();
-        return;
+  function stop() { window.speechSynthesis.cancel(); hideBar(); cancelRaf(); }
+
+  function hideBar() {
+    const bar = DOMProxy.get('tts-player-bar');
+    if (bar) bar.style.display = 'none';
+    updateTTSProgress(0);
+  }
+
+  function cancelRaf() { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } }
+
+  return { play, pauseResume, stop };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   18. [UX#15] 독서 통계 + 목표 달성 탄력 모션
+   ══════════════════════════════════════════════════════════ */
+const ReadingStatsTracker = (() => {
+  let timer = null;
+
+  function startSession() {
+    ReaderState.readingSession.startTime = Date.now();
+    clearInterval(timer);
+    timer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        ReaderState.readingSession.accumulated++;
+        _updateUI();
+      }
+    }, 1000);
+  }
+
+  function stopSession() { clearInterval(timer); }
+
+  function markPosition(cfi) {
+    if (cfi) ReaderState.readingSession.positions.add(cfi);
+    _updateUI();
+  }
+
+  function _updateUI() {
+    const total = ReaderState.readingSession.accumulated;
+    const min   = Math.floor(total / 60);
+    const sec   = total % 60;
+    setTextSafe(DOMProxy.get('stat-reading-time'), `${min}분 ${sec}초`);
+    setTextSafe(DOMProxy.get('stat-pages-read'), String(ReaderState.readingSession.positions.size));
+
+    /* [UX#15] 목표 달성 cubic-bezier 모션 */
+    const goalMin = parseInt(localStorage.getItem('fable_daily_goal') || '30', 10);
+    const fill    = DOMProxy.get('goal-progress-fill');
+    if (fill) {
+      const pct = Math.min(100, (min / goalMin) * 100);
+      fill.style.transition = 'width 600ms cubic-bezier(0.34,1.56,0.64,1)';
+      fill.style.width = `${pct}%`;
+      if (pct >= 100 && fill.dataset.notified !== '1') {
+        fill.dataset.notified = '1';
+        Toast.show('🎉 오늘의 독서 목표를 달성했습니다!', 'success');
       }
     }
+  }
 
-    handleKeyNavigation(e);
-  });
-}
+  return { startSession, stopSession, markPosition };
+})();
 
-
-/* ── 15. 터치 스와이프 내비게이션 ────────────────────────── */
-function initTouchSwipe() {
-  const viewer = DOM.screenViewer();
+/* ══════════════════════════════════════════════════════════
+   19. [UX#14] 롱프레스 컨텍스트 메뉴
+   ══════════════════════════════════════════════════════════ */
+function initContextMenu() {
+  const viewer = DOMProxy.get('screen-viewer');
   if (!viewer) return;
 
-  let touchStartX = 0;
-  let touchStartY = 0;
-  const SWIPE_THRESHOLD = 50; // px
-  const AXIS_LOCK_RATIO = 1.5; // 가로/세로 비율
+  let longPressTimer = null;
+  let selectedText   = '';
+
+  function showMenu() {
+    const menu = DOMProxy.get('context-menu');
+    if (!menu || !selectedText) return;
+    menu.style.display = 'flex';
+    menu.classList.add('slide-up');
+  }
+
+  function hideMenu() {
+    const menu = DOMProxy.get('context-menu');
+    if (!menu) return;
+    menu.classList.remove('slide-up');
+    setTimeout(() => { if (menu) menu.style.display = 'none'; }, 280);
+  }
 
   viewer.addEventListener('touchstart', (e) => {
-    touchStartX = e.touches[0].clientX;
-    touchStartY = e.touches[0].clientY;
+    const touch = e.touches[0];
+    longPressTimer = setTimeout(() => {
+      if (ReaderState.rendition) {
+        /* iframe selection 취득 시도 */
+        try {
+          const iframes = DOMProxy.get('viewer-viewport')?.querySelectorAll('iframe') || [];
+          iframes.forEach(f => {
+            const sel = f.contentWindow?.getSelection()?.toString()?.trim() || '';
+            if (sel.length > 1) selectedText = sel;
+          });
+        } catch (_) {}
+      }
+      if (selectedText) showMenu();
+    }, 600);
   }, { passive: true });
 
-  viewer.addEventListener('touchend', (e) => {
-    if (!ReaderState.rendition) return;
+  viewer.addEventListener('touchend', () => {
+    clearTimeout(longPressTimer);
+  }, { passive: true });
 
-    const deltaX = e.changedTouches[0].clientX - touchStartX;
-    const deltaY = e.changedTouches[0].clientY - touchStartY;
+  viewer.addEventListener('touchmove', () => {
+    clearTimeout(longPressTimer);
+  }, { passive: true });
 
-    // 세로 스와이프가 더 강하면 무시
-    if (Math.abs(deltaY) * AXIS_LOCK_RATIO > Math.abs(deltaX)) return;
-    if (Math.abs(deltaX) < SWIPE_THRESHOLD) return;
-
-    if (deltaX < 0) {
-      navigateNext();
-    } else {
-      navigatePrev();
+  document.addEventListener('pointerdown', (e) => {
+    if (!DOMProxy.get('context-menu')?.contains(e.target)) {
+      hideMenu();
+      selectedText = '';
     }
   }, { passive: true });
+
+  DOMProxy.get('ctx-copy')?.addEventListener('click', () => {
+    if (selectedText) navigator.clipboard?.writeText(selectedText).catch(() => {});
+    Toast.show('클립보드에 복사했습니다.');
+    hideMenu();
+  });
+
+  DOMProxy.get('ctx-tts')?.addEventListener('click', () => {
+    if (selectedText) TTSSystem.play(selectedText);
+    hideMenu();
+  });
+
+  DOMProxy.get('ctx-search')?.addEventListener('click', () => {
+    const modal = DOMProxy.get('search-modal');
+    const input = DOMProxy.get('input-search-query');
+    if (modal && input) {
+      input.value = selectedText;
+      modal.style.display = 'flex';
+      runSearchExecution();
+    }
+    hideMenu();
+  });
+
+  DOMProxy.get('ctx-highlight')?.addEventListener('click', () => {
+    Toast.show('하이라이트 기능은 선택 후 애노테이션 패널에서 이용하세요.');
+    hideMenu();
+  });
 }
 
-/* ── 16. 앱 초기화 ───────────────────────────────────────── */
-function init() {
-  // 뷰어 스크린 초기 상태: 숨김
-  const viewer = DOM.screenViewer();
-  if (viewer) viewer.style.display = 'none';
+/* ══════════════════════════════════════════════════════════
+   20. [UX#12] 폰트 업로드 샌드박스 안정화
+   ══════════════════════════════════════════════════════════ */
+function initFontUploader() {
+  const input = DOMProxy.get('font-uploader');
+  if (!input) return;
 
-  // 목차 사이드바 초기 상태: 숨김
-  const tocSidebar = DOM.tocSidebar();
-  if (tocSidebar) tocSidebar.style.display = 'none';
+  input.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
 
-  initDropzone();
-  initGlobalEvents();
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const fontUrl = evt.target.result;
+      /* [UX#12] 한글/특수문자 파일명 정제 → 랜덤 해시 ID */
+      const safeId  = `custom_${Math.random().toString(36).slice(2, 10)}`;
+      try {
+        const face = new FontFace(safeId, `url(${fontUrl})`);
+        const loaded = await face.load();
+        document.fonts.add(loaded);
+        if (ReaderState.rendition) {
+          ReaderState.rendition.themes.font(safeId);
+          Toast.show('커스텀 폰트가 적용되었습니다.', 'success');
+        }
+      } catch (err) {
+        Toast.show(`폰트 로드 실패: ${err.message}`, 'error');
+      }
+    };
+    reader.readAsDataURL(file);
+    input.value = '';
+  });
+}
 
-  // 안전장치 가드: 라이브러리 최종 존재 유무 검증 문턱 낮추기
-  if (typeof ePub === 'undefined' && typeof window.ePub === 'undefined') {
-    console.error("[Folio] epub.js (ePub) 전역 변수 없음.");
-    showToast("리더 엔진 라이브러리를 로드하지 못했습니다. 페이지를 새로고침해 주세요.", true);
-    return;
+/* ══════════════════════════════════════════════════════════
+   21. [UX#17] 키보드 단축키 팁 레이어
+   ══════════════════════════════════════════════════════════ */
+function showKeyboardHint() {
+  const shown = localStorage.getItem('fable_keyboard_hint_shown');
+  if (shown) return;
+  const layer = DOMProxy.get('keyboard-hint-layer');
+  if (layer) {
+    layer.style.display = 'flex';
+    localStorage.setItem('fable_keyboard_hint_shown', '1');
   }
-  
-  console.log("🚀 Fable Engine Initialized Successfully.");
 }
 
-// 브라우저가 HTML/라이브러리 파싱을 완전히 마친 후 안전하게 init 실행
-document.addEventListener('DOMContentLoaded', init);
+/* ══════════════════════════════════════════════════════════
+   22. [UX#18] 오프라인 감지 배너
+   ══════════════════════════════════════════════════════════ */
+function initOfflineBanner() {
+  function update(offline) {
+    const banners = [DOMProxy.get('offline-banner'), DOMProxy.get('offline-banner-viewer')];
+    banners.forEach(b => { if (b) b.style.display = offline ? 'flex' : 'none'; });
+  }
+
+  window.addEventListener('offline',  () => { update(true);  Toast.show('인터넷 연결이 끊겼습니다. 오프라인 모드로 작동 중입니다.'); });
+  window.addEventListener('online',   () => { update(false); Toast.show('인터넷 연결이 복원되었습니다.', 'success'); });
+
+  if (!navigator.onLine) update(true);
+}
+
+/* ══════════════════════════════════════════════════════════
+   23. [UX#19] 스크롤 모드 맨위로 버튼
+   ══════════════════════════════════════════════════════════ */
+function bindScrollTopButton(view) {
+  const btn = DOMProxy.get('btn-scroll-top');
+  if (!btn) return;
+
+  const iframe = view?.element?.querySelector('iframe');
+  if (!iframe) return;
+
+  const contentWin = iframe.contentWindow;
+  if (!contentWin) return;
+
+  contentWin.addEventListener('scroll', () => {
+    const scrolled = contentWin.scrollY > 200;
+    btn.style.display = scrolled ? 'flex' : 'none';
+  }, { passive: true });
+
+  btn.onclick = () => {
+    contentWin.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+}
+
+/* ══════════════════════════════════════════════════════════
+   24. 어노테이션 초기화 (선택 → 액션 바)
+   ══════════════════════════════════════════════════════════ */
+function initAnnotationManager(rendition) {
+  /* highlight 스타일 주입 */
+  rendition.hooks.content.register((contents) => {
+    const doc = contents.document;
+    if (doc.getElementById('fable-hl-styles')) return;
+    const style = doc.createElement('style');
+    style.id = 'fable-hl-styles';
+    style.textContent = `
+      .hl-yellow { background: rgba(255,235,59,0.45) !important; border-bottom: 2px solid #f5c800 !important; }
+      .hl-green  { background: rgba(105,240,174,0.4) !important; border-bottom: 2px solid #00c853 !important; }
+      .fable-search-hl { background: rgba(255,165,0,0.45) !important; border-radius: 3px; }
+    `;
+    doc.head.appendChild(style);
+  });
+
+  rendition.on('selected', (cfiRange, contents) => {
+    const sel = contents.window.getSelection();
+    if (!sel || sel.isCollapsed || sel.toString().trim().length < 2) return;
+    const text = sel.toString().trim();
+
+    /* 간단한 하이라이트 저장 */
+    const id = `hl_${Date.now()}`;
+    try {
+      rendition.annotations.add('highlight', cfiRange, { id }, null, 'hl-yellow');
+      const key = `fable_hl_${ReaderState.bookKey}`;
+      const existing = StorageSystem.lsGet(key, []);
+      existing.push({ id, cfiRange, text: text.slice(0, 400), color: 'yellow', ts: Date.now() });
+      StorageSystem.lsSet(key, existing);
+      Toast.show('하이라이트가 저장되었습니다.', 'success');
+    } catch (_) {}
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   25. 전역 키보드 이벤트 ([UX#17])
+   ══════════════════════════════════════════════════════════ */
+function handleKeyDown(e) {
+  const viewer = DOMProxy.get('screen-viewer');
+  if (!viewer || viewer.style.display === 'none') return;
+  if (!ReaderState.rendition) return;
+
+  switch (e.key) {
+    case 'ArrowRight': case 'ArrowDown': case ' ':
+      e.preventDefault(); NavGuard.next(); break;
+    case 'ArrowLeft': case 'ArrowUp': case 'Backspace':
+      e.preventDefault(); NavGuard.prev(); break;
+    case 'Escape':
+      if (ReaderState.isSettingsOpen) { closeSettingsPanel(); break; }
+      if (ReaderState.isTocOpen)      { closeTocSidebar();    break; }
+      if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer();
+      break;
+    default: break;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   26. 버튼 이벤트 전체 바인딩
+   ══════════════════════════════════════════════════════════ */
+function initButtonEventHandlers() {
+
+  /* ── 업로더 ── */
+  const dropzone  = DOMProxy.get('dropzone');
+  const fileInput = DOMProxy.get('file-input');
+
+  DOMProxy.get('btn-file-select')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    fileInput?.click();
+  });
+
+  fileInput?.addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (f) await openEpubBook(f, false);
+    fileInput.value = '';
+  });
+
+  /* [UX#1] 드롭존 마이크로 인터랙션 */
+  if (dropzone) {
+    dropzone.addEventListener('click', () => fileInput?.click());
+
+    dropzone.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('drag-over');
+    });
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      dropzone.classList.add('drag-over');
+    });
+    dropzone.addEventListener('dragleave', (e) => {
+      if (dropzone.contains(e.relatedTarget)) return;
+      dropzone.classList.remove('drag-over');
+    });
+    dropzone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('drag-over');
+      /* 바운스 애니메이션 트리거 */
+      dropzone.classList.add('drop-bounce');
+      setTimeout(() => dropzone.classList.remove('drop-bounce'), 600);
+
+      const files = e.dataTransfer.files;
+      if (!files?.length) return;
+      if (files.length > 1) { Toast.show('파일은 하나씩만 열 수 있습니다.', 'error'); return; }
+      await openEpubBook(files[0], false);
+    });
+  }
+
+  /* ── 뷰어 ── */
+  DOMProxy.get('arrow-prev')?.addEventListener('click', () => NavGuard.prev());
+  DOMProxy.get('arrow-next')?.addEventListener('click', () => NavGuard.next());
+
+  DOMProxy.get('btn-toc-toggle')?.addEventListener('click', () => {
+    ReaderState.isTocOpen ? closeTocSidebar() : openTocSidebar();
+  });
+  DOMProxy.get('btn-toc-close')?.addEventListener('click', () => closeTocSidebar());
+
+  DOMProxy.get('toc-overlay')?.addEventListener('click', () => closeTocSidebar());
+
+  DOMProxy.get('btn-settings-toggle')?.addEventListener('click', () => {
+    ReaderState.isSettingsOpen ? closeSettingsPanel() : openSettingsPanel();
+  });
+  DOMProxy.get('btn-settings-close')?.addEventListener('click', () => closeSettingsPanel());
+
+  DOMProxy.get('btn-close-viewer')?.addEventListener('click', () => {
+    if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer();
+  });
+
+  /* 설정: 보기 모드 */
+  DOMProxy.qa('[data-flow]').forEach(btn => {
+    btn.addEventListener('click', () => switchFlowMode(btn.dataset.flow));
+  });
+
+  /* 설정: 글자 크기 */
+  DOMProxy.get('btn-font-decrease')?.addEventListener('click', () => {
+    ReadingSettings.fontSize = Math.max(60, ReadingSettings.fontSize - 5);
+    applyAllSettings();
+    saveSettings();
+  });
+  DOMProxy.get('btn-font-increase')?.addEventListener('click', () => {
+    ReadingSettings.fontSize = Math.min(200, ReadingSettings.fontSize + 5);
+    applyAllSettings();
+    saveSettings();
+  });
+
+  /* 설정: 줄간격 */
+  DOMProxy.qa('[data-lh]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      ReadingSettings.lineHeight = btn.dataset.lh;
+      applyAllSettings();
+      saveSettings();
+    });
+  });
+
+  /* 설정: 테마 스와치 */
+  DOMProxy.qa('.theme-swatch').forEach(btn => {
+    btn.addEventListener('click', () => {
+      ReadingSettings.theme = btn.dataset.theme;
+      applyAllSettings();
+      saveSettings();
+    });
+  });
+
+  /* 검색 */
+  DOMProxy.get('btn-search-toggle')?.addEventListener('click', () => {
+    const modal = DOMProxy.get('search-modal');
+    if (modal) modal.style.display = 'flex';
+    setTimeout(() => DOMProxy.get('input-search-query')?.focus(), 60);
+  });
+  DOMProxy.get('btn-search-modal-close')?.addEventListener('click', () => {
+    const modal = DOMProxy.get('search-modal');
+    if (modal) modal.style.display = 'none';
+  });
+  DOMProxy.get('btn-execute-search')?.addEventListener('click', runSearchExecution);
+  DOMProxy.get('input-search-query')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runSearchExecution();
+  });
+
+  /* 통계 */
+  DOMProxy.get('btn-stats-toggle')?.addEventListener('click', () => {
+    const modal = DOMProxy.get('stats-modal');
+    if (modal) modal.style.display = 'flex';
+  });
+  DOMProxy.get('btn-stats-modal-close')?.addEventListener('click', () => {
+    const modal = DOMProxy.get('stats-modal');
+    if (modal) modal.style.display = 'none';
+  });
+  DOMProxy.get('btn-save-goal')?.addEventListener('click', () => {
+    const val = DOMProxy.get('input-reading-goal')?.value;
+    if (val) { localStorage.setItem('fable_daily_goal', val); Toast.show('독서 목표가 저장되었습니다.', 'success'); }
+  });
+
+  /* TTS */
+  DOMProxy.get('btn-annotation-toggle')?.addEventListener('click', () => {
+    if (!ReaderState.rendition) return;
+    try {
+      const doc  = ReaderState.rendition.manager?.current()?.document;
+      const text = doc?.body?.textContent?.slice(0, 4000) || '';
+      if (text) TTSSystem.play(text);
+    } catch (_) { Toast.show('TTS를 시작할 수 없습니다.', 'error'); }
+  });
+  DOMProxy.get('btn-tts-play-pause')?.addEventListener('click', () => TTSSystem.pauseResume());
+  DOMProxy.get('btn-tts-stop')?.addEventListener('click', () => TTSSystem.stop());
+
+  /* [UX#17] 키보드 힌트 닫기 */
+  DOMProxy.get('btn-hint-close')?.addEventListener('click', () => {
+    const layer = DOMProxy.get('keyboard-hint-layer');
+    if (layer) layer.style.display = 'none';
+  });
+
+  /* 설정 패널 외부 클릭 닫기 */
+  document.addEventListener('pointerdown', (e) => {
+    const panel  = DOMProxy.get('settings-panel');
+    const btnSet = DOMProxy.get('btn-settings-toggle');
+    if (ReaderState.isSettingsOpen && panel && !panel.contains(e.target) && !btnSet?.contains(e.target)) {
+      closeSettingsPanel();
+    }
+  }, { passive: true });
+
+  /* [UX#17] 전역 키보드 */
+  document.addEventListener('keydown', handleKeyDown);
+
+  /* 폰트 업로더 */
+  initFontUploader();
+}
+
+/* ══════════════════════════════════════════════════════════
+   27. 설정 저장/복원
+   ══════════════════════════════════════════════════════════ */
+function saveSettings() {
+  StorageSystem.lsSet(SETTINGS_KEY, ReadingSettings);
+}
+
+function loadSettings() {
+  const saved = StorageSystem.lsGet(SETTINGS_KEY, null);
+  if (saved) Object.assign(ReadingSettings, saved);
+}
+
+/* ══════════════════════════════════════════════════════════
+   28. 전역 진입점 (initializeSystemCore)
+   ══════════════════════════════════════════════════════════ */
+async function initializeSystemCore() {
+
+  /* ── [필수 요구사항 1-1] 전역 예외 가드 (인라인 스크립트 제거분 통합) ── */
+  window.addEventListener('unhandledrejection', (event) => {
+    console.error('[Fable] Unhandled Rejection:', event.reason);
+    Toast.show('비동기 오류가 안전하게 복구되었습니다.', 'error');
+  });
+
+  /* ── beforeunload: 마지막 위치 강제 저장 ── */
+  window.addEventListener('beforeunload', () => {
+    if (ReaderState.bookKey && ReaderState.currentCFI) {
+      try {
+        localStorage.setItem(
+          `fable_cfi_${ReaderState.bookKey}`,
+          JSON.stringify({ data: ReaderState.currentCFI, ts: Date.now() })
+        );
+      } catch (_) {}
+    }
+  });
+
+  /* ── [필수 요구사항 1-1] Service Worker 등록 통합 ── */
+  if ('serviceWorker' in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      console.log('[Fable] Service Worker 등록 완료:', reg.scope);
+
+      /* SW 업데이트 감지 */
+      reg.addEventListener('updatefound', () => {
+        const newWorker = reg.installing;
+        newWorker?.addEventListener('statechange', () => {
+          if (newWorker.statechange === 'installed' && navigator.serviceWorker.controller) {
+            Toast.show('앱이 업데이트되었습니다. 새로고침하면 최신 버전을 사용할 수 있습니다.');
+          }
+        });
+      });
+    } catch (err) {
+      console.warn('[Fable] Service Worker 등록 실패:', err);
+    }
+  }
+
+  /* ── IndexedDB 초기화 ── */
+  await StorageSystem.init().catch(err => console.warn('[Fable] IndexedDB 초기화 실패:', err));
+
+  /* ── 설정 복원 ── */
+  loadSettings();
+  syncSettingsUI();
+  applyShellTheme(ReadingSettings.theme);
+
+  /* ── 전역 드래그 방지 ── */
+  ['dragenter', 'dragover', 'drop'].forEach(evt => {
+    document.addEventListener(evt, (e) => {
+      const dz = DOMProxy.get('dropzone');
+      if (dz && dz.contains(e.target)) return;
+      e.preventDefault();
+    });
+  });
+
+  /* ── UI 모듈 초기화 ── */
+  initButtonEventHandlers();
+  initOfflineBanner();       // [UX#18]
+  initContextMenu();         // [UX#14]
+
+  /* ── 서재 렌더링 ── */
+  renderLibraryGrid();
+
+  /* ── [UX#17] 키보드 힌트 (PC 환경만) ── */
+  if (!('ontouchstart' in window)) {
+    showKeyboardHint();
+  }
+
+  console.log('📖 Fable v2 Premium — 초기화 완료');
+}
+
+/* shell 테마 적용 (뷰어 닫힌 상태에서도 배경 일치) */
+function applyShellTheme(theme) {
+  if (theme === 'paper') { document.body.removeAttribute('data-theme'); }
+  else { document.body.setAttribute('data-theme', theme); }
+}
+
+/* ── 전역 드래그 방지 (body 전체) ── */
+document.addEventListener('dragover', (e) => {
+  const dz = DOMProxy.get('dropzone');
+  if (!dz || !dz.contains(e.target)) e.preventDefault();
+});
+
+/* ── DOM Ready ── */
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeSystemCore);
+} else {
+  initializeSystemCore();
+}

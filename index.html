@@ -3,67 +3,268 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Fable</title>
-  
+  <title>Fable — Premium EPUB Reader</title>
+
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=Noto+Serif+KR:wght@400;700&family=Gowun+Batang:wght@400;700&display=swap" rel="stylesheet">
-  
+
   <link rel="manifest" href="./manifest.json">
   <meta name="theme-color" content="#fcfbf7">
-  
   <link rel="stylesheet" href="./style.css">
-  
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/epubjs/0.3.93/epub.min.js"></script>
 </head>
 <body>
 
-  <div id="app">
-    <div id="screen-uploader" class="app-screen">
-      <div class="dropzone" id="dropzone">
-        <div class="dropzone-icon">📚</div>
+<div id="app">
+
+  <!-- ══ 업로더 스크린 ══════════════════════════════════════ -->
+  <div id="screen-uploader" class="app-screen">
+
+    <!-- [UX#18] 오프라인 배너 -->
+    <div id="offline-banner" class="offline-banner" aria-live="polite" style="display:none;">
+      <span class="offline-dot"></span>오프라인 모드로 안전하게 작동 중입니다
+    </div>
+
+    <div class="uploader-inner">
+      <!-- [UX#1] 드롭존 마이크로 인터랙션 -->
+      <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="EPUB 파일 업로드">
+        <div class="dropzone-icon" id="dropzone-icon">📚</div>
         <h2>EPUB 파일을 여기에 드래그 앤 드롭하세요</h2>
         <p>또는 파일 시스템에서 직접 선택</p>
-        <input type="file" id="epub-file-input" accept=".epub" style="display: none;">
-        <button type="button" class="btn-select" onclick="document.getElementById('epub-file-input').click()">파일 선택</button>
+        <input type="file" id="file-input" accept=".epub" style="display:none;">
+        <button type="button" class="btn-select" id="btn-file-select">파일 선택</button>
       </div>
+
+      <!-- [UX#2] 오프라인 서재 -->
+      <section class="library-section">
+        <h3 class="library-title">내 서재</h3>
+        <!-- 스켈레톤 UI 초기 노출, JS로 교체 -->
+        <div id="library-grid" class="library-grid">
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+          <div class="skeleton-card"></div>
+        </div>
+      </section>
+    </div>
+  </div><!-- /screen-uploader -->
+
+  <!-- ══ 뷰어 스크린 ══════════════════════════════════════ -->
+  <div id="screen-viewer" class="app-screen" style="display:none;">
+
+    <!-- [UX#18] 오프라인 배너 (뷰어용) -->
+    <div id="offline-banner-viewer" class="offline-banner offline-banner--viewer" aria-live="polite" style="display:none;">
+      <span class="offline-dot"></span>오프라인 모드
     </div>
 
-    <div id="screen-viewer" class="app-screen" style="display: none;">
-      <div class="viewer-nav-bar">
-        <div class="nav-left">
-          <button class="nav-action-btn" id="btn-toc-toggle">☰ 목차</button>
-        </div>
-        <div class="nav-title-area" id="book-title-display">도서 제목 정보 로딩 중...</div>
-        <div class="nav-right">
-          <button class="nav-action-btn" id="btn-close-viewer">✕ 닫기</button>
-        </div>
+    <!-- [UX#5] 상단 내비게이션 바 (슬라이딩 토글 대상) -->
+    <header class="viewer-nav-bar" id="viewer-nav-bar">
+      <div class="nav-left">
+        <button class="nav-action-btn" id="btn-toc-toggle" title="목차">☰ 목차</button>
       </div>
+      <div class="nav-title-area" id="nav-book-title">도서 로딩 중...</div>
+      <div class="nav-right">
+        <button class="nav-action-btn" id="btn-search-toggle" title="검색">🔍</button>
+        <button class="nav-action-btn" id="btn-annotation-toggle" title="하이라이트">✏️</button>
+        <button class="nav-action-btn" id="btn-stats-toggle" title="통계">📊</button>
+        <button class="nav-action-btn" id="btn-settings-toggle" title="설정">⚙ 설정</button>
+        <button class="nav-action-btn" id="btn-close-viewer" title="닫기">✕ 닫기</button>
+      </div>
+    </header>
 
+    <!-- 본문 뷰포트 -->
+    <main class="reader-main-frame" id="reader-main-frame">
       <button class="floating-arrow-btn prev" id="arrow-prev" aria-label="이전 페이지">◀</button>
+      <div id="viewer-viewport"></div>
       <button class="floating-arrow-btn next" id="arrow-next" aria-label="다음 페이지">▶</button>
+    </main>
 
-      <div class="reader-main-frame">
-        <div id="viewer-viewport"></div>
+    <!-- [UX#5] 하단 상태 바 (슬라이딩 토글 대상) -->
+    <footer class="viewer-bottom-bar" id="viewer-bottom-bar">
+      <span id="viewer-progress-text">0%</span>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progress-bar-fill"></div>
       </div>
+      <span id="reading-location-range">- / -</span>
+    </footer>
 
-      <div class="viewer-bottom-bar">
-        <span id="reading-percentage">0%</span>
-        <span id="reading-location-range">- / -</span>
+    <!-- [UX#19] 스크롤 모드 맨위로 버튼 -->
+    <button class="scroll-top-btn" id="btn-scroll-top" aria-label="맨 위로" style="display:none;">↑</button>
+
+    <!-- 목차 사이드바 -->
+    <aside id="toc-sidebar" class="toc-sidebar">
+      <div class="toc-header">
+        <h3>목차</h3>
+        <button id="btn-toc-close" aria-label="목차 닫기">✕</button>
       </div>
-      
-      <div id="toc-sidebar" class="toc-sidebar" style="display: none;">
-        <div class="toc-header">
-          <h3>📖 목차 이동</h3>
-          <button id="btn-toc-close">✕</button>
-        </div>
-        <div id="toc-list-container" class="toc-list"></div>
+      <div id="toc-list" class="toc-list"></div>
+    </aside>
+    <!-- [UX#16] 블러 오버레이 -->
+    <div id="toc-overlay" class="toc-sidebar-overlay"></div>
+
+    <!-- [UX#17] 키보드 단축키 팁 레이어 -->
+    <div id="keyboard-hint-layer" class="keyboard-hint-layer" style="display:none;">
+      <div class="keyboard-hint-box">
+        <p class="keyboard-hint-title">⌨ 키보드 단축키</p>
+        <ul>
+          <li><kbd>←</kbd><kbd>→</kbd> 페이지 이동</li>
+          <li><kbd>Space</kbd> 다음 페이지</li>
+          <li><kbd>Backspace</kbd> 이전 페이지</li>
+          <li><kbd>Esc</kbd> 뷰어 닫기</li>
+        </ul>
+        <button id="btn-hint-close" class="keyboard-hint-close">확인</button>
       </div>
     </div>
-  </div>
 
-  <div id="global-toast-container" class="toast-container"></div>
+    <!-- ── 설정 패널 ── -->
+    <div id="settings-panel" class="settings-panel" role="dialog" aria-label="독서 설정">
+      <div class="settings-header">
+        <span class="settings-title">독서 설정</span>
+        <button class="settings-close-btn" id="btn-settings-close" aria-label="설정 닫기">✕</button>
+      </div>
 
-  <script src="./app.js" defer></script>
+      <div class="settings-row">
+        <span class="settings-label">보기 모드</span>
+        <div class="settings-control">
+          <button class="ctrl-btn ctrl-btn--text active" id="btn-view-paginated" data-flow="paginated">가로</button>
+          <button class="ctrl-btn ctrl-btn--text" id="btn-view-scrolled" data-flow="scrolled">세로</button>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+
+      <div class="settings-row">
+        <span class="settings-label">글자 크기</span>
+        <div class="settings-control">
+          <button class="ctrl-btn" id="btn-font-decrease">A−</button>
+          <span class="ctrl-value" id="font-size-display">100%</span>
+          <button class="ctrl-btn" id="btn-font-increase">A+</button>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+
+      <div class="settings-row">
+        <span class="settings-label">줄 간격</span>
+        <div class="settings-control">
+          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-narrow" data-lh="narrow">좁게</button>
+          <button class="ctrl-btn ctrl-btn--text active" id="btn-lh-normal" data-lh="normal">보통</button>
+          <button class="ctrl-btn ctrl-btn--text" id="btn-lh-wide" data-lh="wide">넓게</button>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+
+      <div class="settings-row settings-row--column">
+        <span class="settings-label">배경 테마</span>
+        <div class="settings-control theme-swatch-control">
+          <button class="theme-swatch active" data-theme="paper" aria-label="종이 테마">
+            <span class="swatch-preview swatch-paper"></span>
+            <span class="swatch-name">종이</span>
+          </button>
+          <button class="theme-swatch" data-theme="dark" aria-label="다크 테마">
+            <span class="swatch-preview swatch-dark"></span>
+            <span class="swatch-name">다크</span>
+          </button>
+          <button class="theme-swatch" data-theme="white" aria-label="화이트 테마">
+            <span class="swatch-preview swatch-white"></span>
+            <span class="swatch-name">화이트</span>
+          </button>
+        </div>
+      </div>
+      <div class="settings-divider"></div>
+
+      <div class="settings-row settings-row--column">
+        <span class="settings-label">사용자 폰트 업로드</span>
+        <input type="file" id="font-uploader" accept=".ttf,.otf,.woff,.woff2" style="font-size:11px;">
+      </div>
+    </div><!-- /settings-panel -->
+
+    <!-- ── 검색 모달 ── -->
+    <div id="search-modal" class="modal-overlay" style="display:none;" role="dialog" aria-label="전문 검색">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>🔍 도서 전문 검색</h3>
+          <button class="modal-close-btn" id="btn-search-modal-close">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="search-input-row">
+            <input type="text" id="input-search-query" placeholder="검색어 입력 (2글자 이상)" autocomplete="off">
+            <button id="btn-execute-search" class="ctrl-btn">검색</button>
+          </div>
+          <div id="search-results-container" class="search-results"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 통계/목표 모달 ── -->
+    <div id="stats-modal" class="modal-overlay" style="display:none;" role="dialog" aria-label="독서 통계">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>📊 독서 분석</h3>
+          <button class="modal-close-btn" id="btn-stats-modal-close">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="stats-row">
+            <span class="stats-label">오늘 독서 시간</span>
+            <strong id="stat-reading-time">0분 0초</strong>
+          </div>
+          <div class="stats-row">
+            <span class="stats-label">읽은 위치 포인트</span>
+            <strong id="stat-pages-read">0</strong>
+          </div>
+          <div class="stats-divider"></div>
+          <div class="stats-row">
+            <span class="stats-label">일일 목표 (분)</span>
+            <div style="display:flex;gap:6px;align-items:center;">
+              <input type="number" id="input-reading-goal" value="30" min="1" max="999" style="width:56px;padding:4px 8px;border:1px solid var(--color-border);border-radius:6px;font-size:13px;background:transparent;color:var(--color-ink);">
+              <button id="btn-save-goal" class="ctrl-btn">저장</button>
+            </div>
+          </div>
+          <!-- [UX#15] 목표 달성 프로그레시브 바 -->
+          <div class="goal-track">
+            <div class="goal-fill" id="goal-progress-fill"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TTS 플레이어 바 ── -->
+    <div id="tts-player-bar" class="tts-bar" style="display:none;">
+      <span class="tts-label" id="tts-status-text">🔊 낭독 중...</span>
+      <div class="tts-progress-wrap">
+        <div class="tts-progress-track">
+          <div class="tts-progress-fill" id="tts-progress-fill"></div>
+        </div>
+      </div>
+      <div class="tts-controls">
+        <button class="ctrl-btn" id="btn-tts-play-pause">⏸</button>
+        <button class="ctrl-btn" id="btn-tts-stop">⏹</button>
+      </div>
+    </div>
+
+    <!-- ── 하이라이트 사이드 패널 (동적 생성, 앵커 위치만 선언) ── -->
+    <div id="annotation-panel-anchor"></div>
+
+    <!-- ── 모바일 컨텍스트 메뉴 ── [UX#14] -->
+    <div id="context-menu" class="context-menu" style="display:none;">
+      <button class="ctx-btn" id="ctx-highlight">🖊 하이라이트</button>
+      <button class="ctx-btn" id="ctx-copy">⎘ 복사</button>
+      <button class="ctx-btn" id="ctx-tts">🔊 낭독</button>
+      <button class="ctx-btn" id="ctx-search">🔍 검색</button>
+    </div>
+
+  </div><!-- /screen-viewer -->
+
+</div><!-- /app -->
+
+<!-- 전역 토스트 컨테이너 -->
+<div id="global-toast-container" class="toast-container" aria-live="polite"></div>
+
+<!-- [UX#20] 리사이즈 마스크 (동적 생성용 앵커) -->
+<div id="resize-mask" class="resize-mask" style="display:none;">
+  <div class="spinner"></div>
+  <p>화면 조정 중...</p>
+</div>
+
+<script src="./app.js" defer></script>
 </body>
 </html>
