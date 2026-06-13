@@ -278,33 +278,82 @@ const StorageSystem = {
     });
   },
 
+  /**
+   * [Cascade] 도서 삭제 — 해당 도서의 모든 어노테이션까지 연쇄 제거
+   * 단일 트랜잭션(books + annotations)으로 원자적 처리
+   */
   async deleteBook(bookKey) {
     return new Promise(resolve => {
-      const tx = store.indexedDB.transaction(['books'], 'readwrite');
+      if (!store.indexedDB) return resolve(false);
+      const tx = store.indexedDB.transaction(['books', 'annotations'], 'readwrite');
       tx.objectStore('books').delete(bookKey);
+      /* 어노테이션 연쇄 제거 (bookKey 인덱스 커서) */
+      const annIdx = tx.objectStore('annotations').index('bookKey');
+      const cursorReq = annIdx.openCursor(IDBKeyRange.only(bookKey));
+      cursorReq.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) { cursor.delete(); cursor.continue(); }
+      };
       tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
     });
   },
 
   /**
-   * [요구3] 읽은 기록(퍼센트) 동기화 — 부분 업데이트
+   * [요구2] 읽은 기록(퍼센트) 동기화 — 300ms 디바운스 가드 내장
+   *
+   * 동작 원리:
+   *  - 즉시(동기): 메모리 내부 store.libraryBooks의 해당 레코드 percent/lastReadAt 갱신
+   *  - 지연(300ms): 마지막 호출 후 페이지가 멈춘 시점에만 IndexedDB 디스크 쓰기 1회 수행
+   *  연속 스와이프/키보드 페이지 넘김 중에는 디스크 트랜잭션이 발생하지 않아 병목 제로화
    */
-  async updateBookProgress(bookKey, percent) {
-    return new Promise(resolve => {
-      if (!store.indexedDB) return resolve(false);
-      const tx = store.indexedDB.transaction(['books'], 'readwrite');
-      const os = tx.objectStore('books');
-      const req = os.get(bookKey);
-      req.onsuccess = () => {
-        const rec = req.result;
-        if (rec) {
-          rec.percent    = Math.min(100, Math.max(0, Math.round(percent)));
-          rec.lastReadAt = Date.now();
-          os.put(rec);
-        }
-      };
-      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
-    });
+  _progressDebounceTimer: null,
+  _progressPending: null, /* { bookKey, percent } */
+
+  updateBookProgress(bookKey, percent) {
+    const pct = Math.min(100, Math.max(0, Math.round(percent)));
+    const now = Date.now();
+
+    /* (1) 메모리 내부 스토어 즉시 동기화 — UI 일관성 유지 */
+    const books = store.libraryBooks || [];
+    const rec = books.find(b => b.bookKey === bookKey);
+    if (rec) { rec.percent = pct; rec.lastReadAt = now; }
+
+    /* (2) 디스크 쓰기 디바운스 — 최신 값만 버퍼에 적재 */
+    this._progressPending = { bookKey, percent: pct, lastReadAt: now };
+    clearTimeout(this._progressDebounceTimer);
+    this._progressDebounceTimer = setTimeout(() => {
+      this._flushProgress();
+    }, 300);
+
+    return Promise.resolve(true);
+  },
+
+  /**
+   * 버퍼에 적재된 최종 진행률을 IndexedDB에 1회 커밋
+   */
+  _flushProgress() {
+    const pending = this._progressPending;
+    this._progressPending = null;
+    if (!pending || !store.indexedDB) return;
+    const tx = store.indexedDB.transaction(['books'], 'readwrite');
+    const os = tx.objectStore('books');
+    const req = os.get(pending.bookKey);
+    req.onsuccess = () => {
+      const rec = req.result;
+      if (rec) {
+        rec.percent    = pending.percent;
+        rec.lastReadAt = pending.lastReadAt;
+        os.put(rec);
+      }
+    };
+  },
+
+  /**
+   * 강제 즉시 커밋 (뷰어 종료 / beforeunload 시 잔여 버퍼 flush)
+   */
+  async flushProgressNow() {
+    clearTimeout(this._progressDebounceTimer);
+    this._flushProgress();
   },
 
   /**
@@ -351,17 +400,63 @@ const StorageSystem = {
   },
 
   /**
-   * 폴더 삭제 — 소속 도서들의 folderId를 null로 되돌림
+   * [Cascade Delete] 폴더 완전 삭제 파이프라인
+   * folders + books + annotations 3개 스토어를 단일 트랜잭션으로 원자 처리:
+   *  1) 폴더 엔티티 삭제
+   *  2) folderId 귀속 도서 전부 삭제
+   *  3) 삭제되는 각 도서의 어노테이션(하이라이트/메모) 연쇄 삭제
+   * 트랜잭션이 완전히 oncomplete 된 직후 한 번만 resolve → 호출부에서 단일 store 갱신
+   * @returns {Promise<{ok:boolean, deletedBooks:number}>}
    */
   async deleteFolder(folderId) {
     return new Promise(resolve => {
-      const tx = store.indexedDB.transaction(['folders', 'books'], 'readwrite');
+      if (!store.indexedDB) return resolve({ ok: false, deletedBooks: 0 });
+      const tx = store.indexedDB.transaction(['folders', 'books', 'annotations'], 'readwrite');
+      const booksOS = tx.objectStore('books');
+      const annIdx  = tx.objectStore('annotations').index('bookKey');
+      let   deletedBooks = 0;
+
+      /* 1) 폴더 엔티티 삭제 */
       tx.objectStore('folders').delete(folderId);
-      const idx = tx.objectStore('books').index('folderId');
-      const cursorReq = idx.openCursor(IDBKeyRange.only(folderId));
+
+      /* 2~3) 귀속 도서 + 어노테이션 연쇄 삭제 */
+      const bookIdx   = booksOS.index('folderId');
+      const cursorReq = bookIdx.openCursor(IDBKeyRange.only(folderId));
       cursorReq.onsuccess = (e) => {
         const cursor = e.target.result;
-        if (cursor) { const rec = cursor.value; rec.folderId = null; cursor.update(rec); cursor.continue(); }
+        if (cursor) {
+          const bk = cursor.value.bookKey;
+          /* 도서 레코드 삭제 */
+          cursor.delete();
+          deletedBooks++;
+          /* 해당 도서의 어노테이션 연쇄 삭제 */
+          const annCursorReq = annIdx.openCursor(IDBKeyRange.only(bk));
+          annCursorReq.onsuccess = (ev) => {
+            const annCursor = ev.target.result;
+            if (annCursor) { annCursor.delete(); annCursor.continue(); }
+          };
+          cursor.continue();
+        }
+      };
+
+      /* 4) 트랜잭션 원자성 — 모든 삭제가 settle된 직후 단 한 번 resolve */
+      tx.oncomplete = () => resolve({ ok: true, deletedBooks });
+      tx.onerror    = () => resolve({ ok: false, deletedBooks: 0 });
+    });
+  },
+
+  /**
+   * 특정 도서의 어노테이션만 일괄 삭제 (독립 호출용)
+   */
+  async deleteAnnotationsByBook(bookKey) {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve(false);
+      const tx  = store.indexedDB.transaction(['annotations'], 'readwrite');
+      const idx = tx.objectStore('annotations').index('bookKey');
+      const cursorReq = idx.openCursor(IDBKeyRange.only(bookKey));
+      cursorReq.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) { cursor.delete(); cursor.continue(); }
       };
       tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
     });
@@ -733,7 +828,6 @@ function _injectCustomToIframe() {
    §14. 진행률 UI + [요구3] 퍼센트 IndexedDB 동기화
    ══════════════════════════════════════════════════════════ */
 let _lastSyncedPct = -1;
-let _progressSyncTimer = null;
 
 function updateProgressUI(location) {
   if (!location) return;
@@ -765,13 +859,11 @@ function updateProgressUI(location) {
   const tt = store.totalLocations    >  0 ? store.totalLocations        : '-';
   setTextSafe(DOMProxy.get('reading-location-range'), `${si}\u2013${ei} / ${tt}`);
 
-  /* [요구3] 읽은 기록 IndexedDB 동기화 (디바운스 — 매 페이지 이동 시) */
+  /* [요구2] 읽은 기록 동기화 — updateBookProgress 내부 300ms 디바운스 가드가 처리
+     매 페이지 이동마다 호출해도 메모리만 즉시 갱신되고 디스크 쓰기는 정지 후 1회 */
   if (store.bookKey && pct !== _lastSyncedPct) {
     _lastSyncedPct = pct;
-    clearTimeout(_progressSyncTimer);
-    _progressSyncTimer = setTimeout(() => {
-      StorageSystem.updateBookProgress(store.bookKey, pct);
-    }, 400);
+    StorageSystem.updateBookProgress(store.bookKey, pct);
   }
 }
 
@@ -882,6 +974,7 @@ async function openEpubBook(fileData, isBuffer = false) {
 
     setTextSafe(DOMProxy.get('nav-book-title'), title);
     store.bookKey = 'fable_cfi_' + (title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50);
+    _lastSyncedPct = -1; /* [요구2] 새 책 — 진행률 동기화 캐시 초기화 */
 
     /* [L1] 서재 저장 (표지 + 파일 해시 포함) */
     if (!isBuffer && fileData instanceof File) {
@@ -1024,6 +1117,8 @@ function _updateArrowState(location) {
    §17. 자원 해제 파이프라인
    ══════════════════════════════════════════════════════════ */
 async function destroyCurrentRenditionContext() {
+  /* [요구2] 잔여 진행률 버퍼를 디스크에 즉시 커밋 후 정리 */
+  await StorageSystem.flushProgressNow();
   ReadingStatsTracker.stopSession();
   NavGuard.destroy();
   SearchEngine.destroy();
@@ -1503,11 +1598,20 @@ function renderFolderBar(folders, books) {
     del.setAttribute('aria-label', `${f.name} 폴더 삭제`);
     del.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (confirm(`'${f.name}' 폴더를 삭제하시겠습니까?\n(폴더 안의 도서는 서재에 그대로 남습니다)`)) {
-        StorageSystem.deleteFolder(f.id).then(async () => {
+      /* [요구1-3] 파괴적 유실 방지 — 엄격한 Cascade 경고 */
+      const warn = '이 폴더를 삭제하면 폴더 안의 모든 도서와 독서 퍼센트 기록, 하이라이트가 영구적으로 함께 삭제됩니다. 정말 삭제하시겠습니까?';
+      if (confirm(warn)) {
+        /* [요구1-4] 트랜잭션 원자성 — DB cascade 완료(await) 직후 store 1회 갱신 */
+        StorageSystem.deleteFolder(f.id).then(async (result) => {
           if (store.activeFolderId === f.id) store.activeFolderId = null;
-          await refreshLibraryData();
-          Toast.show('폴더가 삭제되었습니다.', 'success');
+          /* 단일 트랜잭션 settle 후 libraryBooks + folders를 한 번에 patch (플리커 제로) */
+          const [books, folders] = await Promise.all([
+            StorageSystem.getAllBooks(),
+            StorageSystem.getAllFolders(),
+          ]);
+          ReactiveStore.patch({ libraryBooks: books, folders });
+          const n = result?.deletedBooks || 0;
+          Toast.show(n > 0 ? `폴더와 도서 ${n}권이 삭제되었습니다.` : '폴더가 삭제되었습니다.', 'success');
         });
       }
     });
@@ -1613,10 +1717,11 @@ function _showCardMenu(book, anchorEl) {
   delItem.addEventListener('click', (e) => {
     e.stopPropagation();
     menu.remove();
-    if (confirm('이 도서를 서재에서 제거하시겠습니까?')) {
+    /* [요구1-2] 도서 삭제 시 하이라이트/메모 연쇄 제거 안내 */
+    if (confirm('이 도서를 삭제하면 독서 기록과 하이라이트·메모가 함께 영구 삭제됩니다. 삭제하시겠습니까?')) {
       StorageSystem.deleteBook(book.bookKey).then(async () => {
         await refreshLibraryData();
-        Toast.show('도서가 삭제되었습니다.', 'success');
+        Toast.show('도서와 관련 기록이 삭제되었습니다.', 'success');
       });
     }
   });
@@ -2209,6 +2314,8 @@ async function initializeSystemCore() {
     if (store.bookKey && store.currentCFI) {
       try { localStorage.setItem('fable_cfi_' + store.bookKey, JSON.stringify({ data: store.currentCFI, ts: Date.now() })); } catch (_) {}
     }
+    /* [요구2] 잔여 진행률 버퍼 강제 커밋 (페이지 이탈 직전) */
+    try { StorageSystem.flushProgressNow(); } catch (_) {}
   });
 
   if ('serviceWorker' in navigator) {
