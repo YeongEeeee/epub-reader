@@ -1,19 +1,16 @@
 /**
  * ============================================================
- * Fable v3 Premium — app.js
- * Proxy 기반 리액티브 아키텍처 · Error Boundary · 자원 해제 파이프라인
+ * Fable v3 Premium — app.js  (v3.1 서재 고도화 에디션)
+ * Proxy 기반 리액티브 아키텍처 완전 계승
  *
- * 필수 요구사항:
- *  [R1] Proxy 기반 Reactive Store — syncSettingsUI 폐기
- *  [R2] Null-Safe DOMProxy (Null Object Pattern)
- *  [R2b] FOUC 뮤텍스 가드 (rendition.hooks + rendered)
- *  [R2c] 메모리 누수 자원 해제 파이프라인
- *  [R3] Error Boundary Manager (도메인 격리)
- *
- * UX 고도화 20선 + 초고급 상용 스펙 3선:
- *  #21 오프라인 하이라이트 충돌 해결 엔진 (UUID + LWW Merge)
- *  #22 가상 스크롤 검색 레이어 (IntersectionObserver 재활용 풀)
- *  #23 커스텀 테마 빌더 (CSS Variable 실시간 주입 + epub.js 관통)
+ * 신규 요구사항:
+ *  [B1] ePub 폴드 가드 — window.ePub 존재 확인 후 초기화
+ *  [B2] ErrorBoundary.wrap('renderer') 메타데이터 파싱 완전 래핑
+ *  [L1] 표지 이미지 + 스마트 타이틀 책장 (Base64 추출 저장)
+ *  [L2] CSS 툴팁 — 전체 제목 hover/롱터치 팝업
+ *  [L3] 다중 파일 순차 등록 파이프라인 (for-of await)
+ *  [U1] 미니멀 상단 컨트롤 바 (서재 화면)
+ *  [U2] 설정 패널 양쪽 화면 공용화
  * ============================================================
  */
 
@@ -22,14 +19,15 @@
 /* ══════════════════════════════════════════════════════════
    §0. 상수
    ══════════════════════════════════════════════════════════ */
-const LH_MAP   = { narrow: '1.5', normal: '1.85', wide: '2.3' };
+const LH_MAP    = { narrow: '1.5', normal: '1.85', wide: '2.3' };
 const STATE_KEY = 'fable_v3_state';
 const SYNC_TAG  = 'fable-annotation-sync';
 const DB_NAME   = 'FableV3DB';
-const DB_VER    = 3;
+const DB_VER    = 5; /* v5: 폴더 + 읽은 기록(퍼센트) 추가 */
+const RECENT_MAX = 3; /* 최근 읽은 책 표시 개수 */
 
 /* ══════════════════════════════════════════════════════════
-   §1. [R3] Error Boundary Manager
+   §1. Error Boundary Manager
    ══════════════════════════════════════════════════════════ */
 const ErrorBoundary = (() => {
   const handlers = {};
@@ -52,7 +50,7 @@ const ErrorBoundary = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §2. [R2] Null-Safe DOMProxy (Null Object Pattern)
+   §2. Null-Safe DOMProxy
    ══════════════════════════════════════════════════════════ */
 const DOMProxy = (() => {
   const cache = new Map();
@@ -66,7 +64,7 @@ const DOMProxy = (() => {
                       'querySelectorAll','focus','click','remove','setAttribute',
                       'removeAttribute','dispatchEvent','contains'];
       if (NO_OPS.includes(prop)) return () => VOID_NODE;
-      if (prop === 'textContent' || prop === 'innerHTML' || prop === 'value') return '';
+      if (['textContent','innerHTML','value','src'].includes(prop)) return '';
       if (prop === 'offsetHeight') return 0;
       if (prop === 'disabled') return false;
       return VOID_NODE;
@@ -88,7 +86,7 @@ const DOMProxy = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §3. [R1] Proxy 기반 Reactive Store
+   §3. Proxy 기반 Reactive Store
    ══════════════════════════════════════════════════════════ */
 const ReactiveStore = (() => {
   const subscribers = new Map();
@@ -121,6 +119,12 @@ const ReactiveStore = (() => {
     readingSession: { startTime: Date.now(), accumulated: 0, positions: new Set() },
     fontSize: 100, lineHeight: 'normal', theme: 'paper', flow: 'paginated',
     userBg: '#f4f1ea', userInk: '#1a1814', userSpacing: 0, userLeading: 1.85,
+    /* [U1] 서재 화면에서도 설정 패널 열림 여부 추적 */
+    isViewerOpen: false,
+    /* [v5] 서재 데이터 상태 트리 — 변경 시 그리드 자동 재렌더 */
+    libraryBooks:   [],   /* 전체 도서 캐시 */
+    folders:        [],   /* 폴더 목록 */
+    activeFolderId: null, /* 현재 필터된 폴더 (null = 전체) */
   };
 
   const store = new Proxy(rawState, {
@@ -147,7 +151,7 @@ const ReactiveStore = (() => {
 const store = ReactiveStore.store;
 
 /* ══════════════════════════════════════════════════════════
-   §4. [UX#8] 논블로킹 스택 토스트
+   §4. Toast
    ══════════════════════════════════════════════════════════ */
 const Toast = (() => {
   const DURATION = 3000, FADE_OUT = 280, MAX_STACK = 4;
@@ -172,7 +176,6 @@ const Toast = (() => {
   return { show };
 })();
 
-/* Error Boundary 기본 핸들러 */
 ErrorBoundary.register('global',   (e) => Toast.show(`오류: ${e?.message ?? '알 수 없는 오류'}`, 'error'));
 ErrorBoundary.register('storage',  (e) => Toast.show(`저장소 오류: ${e?.message}`, 'error'));
 ErrorBoundary.register('renderer', (e) => Toast.show(`렌더링 오류: ${e?.message}`, 'error'));
@@ -186,7 +189,11 @@ function setTextSafe(el, text) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §6. StorageSystem (IndexedDB + localStorage LRU)
+   §6. StorageSystem (IndexedDB v5 — 폴더 + 읽은 기록 추가)
+   books 레코드 필드:
+     bookKey, bytes, title, creator, coverDataUrl, ts,
+     folderId(폴더 소속), fileHash(중복 방지), percent(읽은 %), lastReadAt
+   folders 레코드 필드: id, name, ts
    ══════════════════════════════════════════════════════════ */
 const StorageSystem = {
   init: ErrorBoundary.wrap('storage', async function init() {
@@ -194,24 +201,62 @@ const StorageSystem = {
       const req = indexedDB.open(DB_NAME, DB_VER);
       req.onupgradeneeded = (e) => {
         const db = e.target.result;
+        /* books 스토어 */
         if (!db.objectStoreNames.contains('books')) {
-          db.createObjectStore('books', { keyPath: 'bookKey' });
+          const bs = db.createObjectStore('books', { keyPath: 'bookKey' });
+          bs.createIndex('folderId', 'folderId', { unique: false });
+          bs.createIndex('fileHash', 'fileHash', { unique: false });
+        } else {
+          /* 기존 books 스토어에 인덱스 추가 (v5 업그레이드) */
+          const bs = e.target.transaction.objectStore('books');
+          if (!bs.indexNames.contains('folderId')) bs.createIndex('folderId', 'folderId', { unique: false });
+          if (!bs.indexNames.contains('fileHash')) bs.createIndex('fileHash', 'fileHash', { unique: false });
         }
         if (!db.objectStoreNames.contains('annotations')) {
           const as = db.createObjectStore('annotations', { keyPath: 'uuid' });
           as.createIndex('bookKey',     'bookKey',     { unique: false });
           as.createIndex('pendingSync', 'pendingSync', { unique: false });
         }
+        /* [신규] folders 스토어 */
+        if (!db.objectStoreNames.contains('folders')) {
+          db.createObjectStore('folders', { keyPath: 'id' });
+        }
       };
-      req.onsuccess = (e) => { store.indexedDB = e.target.result; resolve(); };
-      req.onerror   = () => reject(new Error('IndexedDB 초기화 실패'));
+      req.onsuccess  = (e) => { store.indexedDB = e.target.result; resolve(); };
+      req.onerror    = () => reject(new Error('IndexedDB 초기화 실패'));
     });
   }),
 
-  async saveBook(bookKey, buffer, title, creator) {
+  /**
+   * [L1] 표지 dataUrl + 폴더/해시/진행률 포함 저장
+   * 기존 레코드가 있으면 진행률/폴더 정보를 보존합니다.
+   */
+  async saveBook(bookKey, buffer, title, creator, coverDataUrl = null, fileHash = null) {
     return new Promise((resolve, reject) => {
       const tx = store.indexedDB.transaction(['books'], 'readwrite');
-      tx.objectStore('books').put({ bookKey, bytes: buffer, title: title || '제목 없음', creator: creator || '', ts: Date.now() });
+      const os = tx.objectStore('books');
+      /* 기존 레코드 조회 — 진행률·폴더 보존 */
+      const getReq = os.get(bookKey);
+      getReq.onsuccess = () => {
+        const prev = getReq.result || {};
+        os.put({
+          bookKey,
+          bytes:        buffer,
+          title:        title || prev.title || '제목 없음',
+          creator:      creator || prev.creator || '',
+          coverDataUrl: coverDataUrl ?? prev.coverDataUrl ?? null,
+          fileHash:     fileHash ?? prev.fileHash ?? null,
+          folderId:     prev.folderId ?? null,
+          percent:      prev.percent ?? 0,
+          lastReadAt:   prev.lastReadAt ?? null,
+          ts:           prev.ts ?? Date.now(),
+        });
+      };
+      getReq.onerror = () => {
+        os.put({ bookKey, bytes: buffer, title: title || '제목 없음', creator: creator || '',
+                 coverDataUrl: coverDataUrl || null, fileHash: fileHash || null,
+                 folderId: null, percent: 0, lastReadAt: null, ts: Date.now() });
+      };
       tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
     });
   },
@@ -219,9 +264,17 @@ const StorageSystem = {
   async getAllBooks() {
     return new Promise(resolve => {
       if (!store.indexedDB) return resolve([]);
-      const tx = store.indexedDB.transaction(['books'], 'readonly');
+      const tx  = store.indexedDB.transaction(['books'], 'readonly');
       const req = tx.objectStore('books').getAll();
       req.onsuccess = () => resolve(req.result || []); req.onerror = () => resolve([]);
+    });
+  },
+
+  async getBook(bookKey) {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve(null);
+      const req = store.indexedDB.transaction(['books'], 'readonly').objectStore('books').get(bookKey);
+      req.onsuccess = () => resolve(req.result || null); req.onerror = () => resolve(null);
     });
   },
 
@@ -229,6 +282,87 @@ const StorageSystem = {
     return new Promise(resolve => {
       const tx = store.indexedDB.transaction(['books'], 'readwrite');
       tx.objectStore('books').delete(bookKey);
+      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
+    });
+  },
+
+  /**
+   * [요구3] 읽은 기록(퍼센트) 동기화 — 부분 업데이트
+   */
+  async updateBookProgress(bookKey, percent) {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve(false);
+      const tx = store.indexedDB.transaction(['books'], 'readwrite');
+      const os = tx.objectStore('books');
+      const req = os.get(bookKey);
+      req.onsuccess = () => {
+        const rec = req.result;
+        if (rec) {
+          rec.percent    = Math.min(100, Math.max(0, Math.round(percent)));
+          rec.lastReadAt = Date.now();
+          os.put(rec);
+        }
+      };
+      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
+    });
+  },
+
+  /**
+   * 도서를 특정 폴더로 이동 (folderId = null 이면 폴더에서 제거)
+   */
+  async setBookFolder(bookKey, folderId) {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve(false);
+      const tx = store.indexedDB.transaction(['books'], 'readwrite');
+      const os = tx.objectStore('books');
+      const req = os.get(bookKey);
+      req.onsuccess = () => { const rec = req.result; if (rec) { rec.folderId = folderId; os.put(rec); } };
+      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
+    });
+  },
+
+  /**
+   * 중복 방지: 동일 fileHash 보유 도서 존재 여부
+   */
+  async findBookByHash(fileHash) {
+    return new Promise(resolve => {
+      if (!store.indexedDB || !fileHash) return resolve(null);
+      const req = store.indexedDB.transaction(['books'], 'readonly')
+                      .objectStore('books').index('fileHash').get(fileHash);
+      req.onsuccess = () => resolve(req.result || null); req.onerror = () => resolve(null);
+    });
+  },
+
+  /* ── 폴더 CRUD ── */
+  async getAllFolders() {
+    return new Promise(resolve => {
+      if (!store.indexedDB) return resolve([]);
+      const req = store.indexedDB.transaction(['folders'], 'readonly').objectStore('folders').getAll();
+      req.onsuccess = () => resolve(req.result || []); req.onerror = () => resolve([]);
+    });
+  },
+
+  async saveFolder(folder) {
+    return new Promise(resolve => {
+      const tx = store.indexedDB.transaction(['folders'], 'readwrite');
+      tx.objectStore('folders').put(folder);
+      tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
+    });
+  },
+
+  /**
+   * 폴더 삭제 — 소속 도서들의 folderId를 null로 되돌림
+   */
+  async deleteFolder(folderId) {
+    return new Promise(resolve => {
+      const tx = store.indexedDB.transaction(['folders', 'books'], 'readwrite');
+      tx.objectStore('folders').delete(folderId);
+      const idx = tx.objectStore('books').index('folderId');
+      const cursorReq = idx.openCursor(IDBKeyRange.only(folderId));
+      cursorReq.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) { const rec = cursor.value; rec.folderId = null; cursor.update(rec); cursor.continue(); }
+      };
       tx.oncomplete = () => resolve(true); tx.onerror = () => resolve(false);
     });
   },
@@ -261,8 +395,8 @@ const StorageSystem = {
 
   async markAnnotationSynced(uuid) {
     return new Promise(resolve => {
-      const tx = store.indexedDB.transaction(['annotations'], 'readwrite');
-      const s  = tx.objectStore('annotations');
+      const tx  = store.indexedDB.transaction(['annotations'], 'readwrite');
+      const s   = tx.objectStore('annotations');
       const req = s.get(uuid);
       req.onsuccess = () => {
         if (req.result) { req.result.pendingSync = 0; s.put(req.result); }
@@ -303,7 +437,7 @@ const StorageSystem = {
 };
 
 /* ══════════════════════════════════════════════════════════
-   §7. [UX#21] 충돌 해결 싱크 엔진 (UUID + LWW Merge)
+   §7. Annotation Sync Engine (UUID + LWW Merge)
    ══════════════════════════════════════════════════════════ */
 const AnnotationSyncEngine = (() => {
   function uuid() {
@@ -323,15 +457,6 @@ const AnnotationSyncEngine = (() => {
     return ann;
   }
 
-  async function updateNote(uuid_, note) {
-    const all = await StorageSystem.getAnnotationsByBook(store.bookKey);
-    const ann = all.find(a => a.uuid === uuid_);
-    if (!ann) return;
-    ann.note = note; ann.device_timestamp = Date.now(); ann.pendingSync = 1;
-    await ErrorBoundary.wrap('storage', () => StorageSystem.saveAnnotation(ann))();
-  }
-
-  /* Last-Write-Wins Merge: 동일 CFI에 두 항목이 충돌하면 device_timestamp 큰 쪽 우선 */
   function mergeWithLWW(remoteItems, localItems) {
     const merged = new Map();
     remoteItems.forEach(r => merged.set(r.cfiRange, r));
@@ -347,10 +472,8 @@ const AnnotationSyncEngine = (() => {
     if (!pending.length) return;
 
     if ('serviceWorker' in navigator && 'SyncManager' in window) {
-      try {
-        const reg = await navigator.serviceWorker.ready;
-        await reg.sync.register(SYNC_TAG); return;
-      } catch (_) {}
+      try { const reg = await navigator.serviceWorker.ready; await reg.sync.register(SYNC_TAG); return; }
+      catch (_) {}
     }
 
     if (navigator.serviceWorker?.controller) {
@@ -358,7 +481,6 @@ const AnnotationSyncEngine = (() => {
       return;
     }
 
-    /* 직접 fetch 스텁 */
     try {
       const res = await fetch('https://api.fable.example/annotations/sync', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -382,11 +504,11 @@ const AnnotationSyncEngine = (() => {
     });
   }
 
-  return { create, updateNote, mergeWithLWW, syncPending };
+  return { create, mergeWithLWW, syncPending };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §8. [R2c] 자원 해제 파이프라인
+   §8. Resource Registry (Memory Leak 방지)
    ══════════════════════════════════════════════════════════ */
 const ResourceRegistry = (() => {
   const listeners = [], storeSubs = [], timers = [], resizeObs = [];
@@ -414,7 +536,7 @@ const ResourceRegistry = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §9. [UX#4] 화면 크로스페이드 전환
+   §9. 화면 전환
    ══════════════════════════════════════════════════════════ */
 function showViewerScreen() {
   const up = DOMProxy.get('screen-uploader'), vi = DOMProxy.get('screen-viewer');
@@ -426,6 +548,7 @@ function showViewerScreen() {
     vi.style.transition = 'opacity 300ms ease, transform 300ms ease';
     requestAnimationFrame(() => requestAnimationFrame(() => { vi.style.opacity = '1'; vi.style.transform = 'scale(1)'; }));
   }, 300);
+  store.isViewerOpen = true;
 }
 
 function showUploaderScreen() {
@@ -438,6 +561,7 @@ function showUploaderScreen() {
     requestAnimationFrame(() => requestAnimationFrame(() => { up.style.opacity = '1'; }));
     setTimeout(() => { up.style.transition = ''; }, 300);
   }, 260);
+  store.isViewerOpen = false;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -461,7 +585,7 @@ const LoadingOverlay = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §11. [UX#20] 리사이즈 마스크
+   §11. 리사이즈 마스크
    ══════════════════════════════════════════════════════════ */
 const ResizeMask = {
   show() { DOMProxy.get('resize-mask').style.display = 'flex'; },
@@ -469,7 +593,28 @@ const ResizeMask = {
 };
 
 /* ══════════════════════════════════════════════════════════
-   §12. [R1] Reactive UI Binders 마운트
+   §12. 파일 추가 진행 바
+   ══════════════════════════════════════════════════════════ */
+const ImportProgress = (() => {
+  function show(text = '도서 추가 중...') {
+    const bar = DOMProxy.get('import-progress-bar');
+    bar.style.display = 'flex';
+    setTextSafe(DOMProxy.get('import-progress-text'), text);
+    DOMProxy.get('import-progress-fill').style.width = '0%';
+  }
+  function update(pct, text) {
+    DOMProxy.get('import-progress-fill').style.width = `${pct}%`;
+    if (text) setTextSafe(DOMProxy.get('import-progress-text'), text);
+  }
+  function hide() {
+    const bar = DOMProxy.get('import-progress-bar');
+    bar.style.display = 'none';
+  }
+  return { show, update, hide };
+})();
+
+/* ══════════════════════════════════════════════════════════
+   §13. Reactive UI Binders
    ══════════════════════════════════════════════════════════ */
 function mountReactiveBinders() {
 
@@ -542,25 +687,36 @@ function mountReactiveBinders() {
     }
   });
 
+  /* [U2] isSettingsOpen — 서재/뷰어 공용 설정 패널 */
   ReactiveStore.subscribe('isSettingsOpen', (open) => {
     const panel = DOMProxy.get('settings-panel');
-    const btn   = DOMProxy.get('btn-settings-toggle');
+    /* 뷰어 버튼 */
+    const btnV = DOMProxy.get('btn-settings-toggle');
+    /* 서재 버튼 */
+    const btnL = DOMProxy.get('btn-library-settings');
+
     if (open) {
       panel.style.display = 'flex'; panel.offsetHeight;
-      panel.classList.add('open'); btn.classList.add('active');
-      btn.setAttribute('aria-expanded', 'true');
+      panel.classList.add('open');
+      btnV.classList.add('active'); btnV.setAttribute('aria-expanded', 'true');
+      btnL.classList.add('active'); btnL.setAttribute('aria-expanded', 'true');
     } else {
-      panel.classList.remove('open'); btn.classList.remove('active');
-      btn.setAttribute('aria-expanded', 'false');
+      panel.classList.remove('open');
+      btnV.classList.remove('active'); btnV.setAttribute('aria-expanded', 'false');
+      btnL.classList.remove('active'); btnL.setAttribute('aria-expanded', 'false');
       setTimeout(() => { if (!store.isSettingsOpen) panel.style.display = 'none'; }, 240);
     }
   });
 
-  /* [UX#23] 커스텀 테마 CSS 변수 실시간 주입 */
   ReactiveStore.subscribe('userBg',      (v) => { document.documentElement.style.setProperty('--color-user-bg', v);         _injectCustomToIframe(); });
   ReactiveStore.subscribe('userInk',     (v) => { document.documentElement.style.setProperty('--color-user-ink', v);        _injectCustomToIframe(); });
   ReactiveStore.subscribe('userSpacing', (v) => { document.documentElement.style.setProperty('--user-letter-spacing', v + 'em'); _injectCustomToIframe(); });
   ReactiveStore.subscribe('userLeading', (v) => { document.documentElement.style.setProperty('--user-line-height', String(v)); _injectCustomToIframe(); });
+
+  /* [v5] 서재 데이터 상태 → 그리드 자동 재렌더 (Reactive 일관성) */
+  ReactiveStore.subscribe('libraryBooks',   () => renderLibraryGrid());
+  ReactiveStore.subscribe('folders',        () => renderLibraryGrid());
+  ReactiveStore.subscribe('activeFolderId', () => renderLibraryGrid());
 }
 
 function _injectCustomToIframe() {
@@ -574,8 +730,11 @@ function _injectCustomToIframe() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §13. [UX#6] 진행률 즉각 연동
+   §14. 진행률 UI + [요구3] 퍼센트 IndexedDB 동기화
    ══════════════════════════════════════════════════════════ */
+let _lastSyncedPct = -1;
+let _progressSyncTimer = null;
+
 function updateProgressUI(location) {
   if (!location) return;
   let pct = 0;
@@ -591,53 +750,163 @@ function updateProgressUI(location) {
   }
   pct = Math.min(100, Math.max(0, pct));
 
-  const fill = DOMProxy.get('progress-bar-fill');
-  fill.style.width = `${pct}%`;
+  DOMProxy.get('progress-bar-fill').style.width = `${pct}%`;
   DOMProxy.q('.progress-bar-track').setAttribute('aria-valuenow', pct);
   setTextSafe(DOMProxy.get('viewer-progress-text'), `${pct}%`);
+
+  /* [요구3] 퍼센트 이동 드래그 바 동기화 (드래그 중이 아닐 때만) */
+  const slider = DOMProxy.get('progress-range-slider');
+  if (slider && slider !== DOMProxy.VOID_NODE && !slider.dataset.dragging) {
+    slider.value = pct;
+  }
 
   const si = location.start.location >= 0 ? location.start.location + 1 : '-';
   const ei = location.end.location   >= 0 ? location.end.location   + 1 : '-';
   const tt = store.totalLocations    >  0 ? store.totalLocations        : '-';
   setTextSafe(DOMProxy.get('reading-location-range'), `${si}\u2013${ei} / ${tt}`);
+
+  /* [요구3] 읽은 기록 IndexedDB 동기화 (디바운스 — 매 페이지 이동 시) */
+  if (store.bookKey && pct !== _lastSyncedPct) {
+    _lastSyncedPct = pct;
+    clearTimeout(_progressSyncTimer);
+    _progressSyncTimer = setTimeout(() => {
+      StorageSystem.updateBookProgress(store.bookKey, pct);
+    }, 400);
+  }
 }
 
 /* ══════════════════════════════════════════════════════════
-   §14. epub.js 렌더링 엔진
+   §15. [L1] 표지 이미지 추출 (epub.js book.loaded.cover)
    ══════════════════════════════════════════════════════════ */
+async function extractCoverDataUrl(book) {
+  try {
+    /* epub.js: book.loaded.cover → cover path → archive URL → canvas → dataURL */
+    const coverPath = await book.loaded.cover;
+    if (!coverPath) return null;
+
+    const coverUrl = await book.archive.createUrl(coverPath, { base64: true });
+    if (!coverUrl) return null;
+
+    /* Base64 URL이면 그대로 사용, blob URL이면 canvas 변환 */
+    if (coverUrl.startsWith('data:')) return coverUrl;
+
+    return await new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          /* 썸네일 크기로 리사이즈 (메모리 절약) */
+          const MAX = 200;
+          const ratio = Math.min(MAX / img.width, MAX / img.height, 1);
+          canvas.width  = Math.round(img.width  * ratio);
+          canvas.height = Math.round(img.height * ratio);
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.7));
+        } catch (_) { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = coverUrl;
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   §16. epub.js 렌더링 엔진
+   ══════════════════════════════════════════════════════════ */
+/**
+ * [B1] ePub 폴드 가드 — window.ePub 존재 확인
+ * epub.js CDN이 아직 파싱 중이라면 최대 5초 대기
+ */
+async function waitForEpubJS(maxWaitMs = 5000) {
+  if (typeof window.ePub === 'function') return true;
+
+  return new Promise((resolve) => {
+    const start    = Date.now();
+    const interval = setInterval(() => {
+      if (typeof window.ePub === 'function') {
+        clearInterval(interval);
+        resolve(true);
+        return;
+      }
+      if (Date.now() - start >= maxWaitMs) {
+        clearInterval(interval);
+        resolve(false);
+      }
+    }, 50);
+  });
+}
+
 async function openEpubBook(fileData, isBuffer = false) {
+  /* [B1] ePub 가드 */
+  const epubReady = await waitForEpubJS();
+  if (!epubReady) {
+    Toast.show('epub.js 라이브러리를 로드하지 못했습니다. 페이지를 새로고침해 주세요.', 'error');
+    return;
+  }
+
   showViewerScreen();
   LoadingOverlay.show('도서 버퍼를 확장하는 중...');
   await destroyCurrentRenditionContext();
 
-  await ErrorBoundary.wrap('renderer', async () => {
+  /* [B2] 전체 파싱 스트림을 ErrorBoundary.wrap('renderer')으로 완전 래핑 */
+  const result = await ErrorBoundary.wrap('renderer', async () => {
+    /* 타임아웃 가드 15s */
     const book = await Promise.race([
-      new Promise((res, rej) => { const b = ePub(fileData); b.ready.then(() => res(b)).catch(rej); }),
+      new Promise((res, rej) => {
+        try {
+          const b = window.ePub(fileData);
+          b.ready.then(() => res(b)).catch(rej);
+        } catch (e) { rej(e); }
+      }),
       new Promise((_, rej) => setTimeout(() => rej(new Error('도서 디코딩 타임아웃 (15s)')), 15000)),
     ]);
     store.book = book;
 
-    const [meta, nav] = await Promise.all([book.loaded.metadata, book.loaded.navigation]);
-    const title = meta.title || '제목 없음', creator = meta.creator || '';
+    /* 메타 + 내비게이션 병렬 로드 (각각 에러 격리) */
+    let title = '제목 없음', creator = '';
+    try {
+      const meta = await book.loaded.metadata;
+      title   = meta.title   || '제목 없음';
+      creator = meta.creator || '';
+    } catch (_) {}
+
+    let toc = [];
+    try {
+      const nav = await book.loaded.navigation;
+      toc = nav.toc || [];
+    } catch (_) {}
+
     setTextSafe(DOMProxy.get('nav-book-title'), title);
     store.bookKey = 'fable_cfi_' + (title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50);
 
+    /* [L1] 서재 저장 (표지 + 파일 해시 포함) */
     if (!isBuffer && fileData instanceof File) {
-      const buf = await fileData.arrayBuffer();
-      await StorageSystem.saveBook(store.bookKey, buf, title, creator);
-      renderLibraryGrid();
+      const buf          = await fileData.arrayBuffer();
+      const coverDataUrl = await extractCoverDataUrl(book);
+      const fileHash     = computeFileHash(fileData);
+      await StorageSystem.saveBook(store.bookKey, buf, title, creator, coverDataUrl, fileHash);
+      await refreshLibraryData();
     }
 
-    renderTocSidebar(nav.toc || []);
+    renderTocSidebar(toc);
     initRenditionEngine(book);
     generateLocationsBackground(book);
     ReadingStatsTracker.startSession();
 
     const annotations = await StorageSystem.getAnnotationsByBook(store.bookKey);
     AnnotationManager.restoreAll(annotations);
+
+    return true;
   })();
 
-  if (!store.rendition) { LoadingOverlay.hide(); exitViewer(); }
+  if (!result || !store.rendition) {
+    LoadingOverlay.hide();
+    exitViewer();
+  }
 }
 
 /* ── 테마 등록 ── */
@@ -670,7 +939,7 @@ function registerEpubThemes(rendition) {
   });
 }
 
-/* [R2b] FOUC 방지 콘텐츠 스타일 즉시 주입 */
+/* FOUC 방지 스타일 주입 */
 function injectContentStyles(contents) {
   const doc = contents.document;
   if (!doc) return;
@@ -701,7 +970,7 @@ function initRenditionEngine(book) {
   store.rendition = rendition;
 
   registerEpubThemes(rendition);
-  rendition.hooks.content.register(injectContentStyles); /* [R2b] */
+  rendition.hooks.content.register(injectContentStyles);
   _applyAllRenditionSettings(rendition);
 
   const savedCFI = StorageSystem.lsGet('fable_cfi_' + store.bookKey, '');
@@ -733,7 +1002,7 @@ function initRenditionEngine(book) {
     store.navBarsVisible = !store.navBarsVisible;
   });
   rendition.on('rendered', (section, view) => {
-    if (view?.document) injectContentStyles({ document: view.document }); /* [R2b] 재확인 */
+    if (view?.document) injectContentStyles({ document: view.document });
     if (store.flow === 'scrolled') bindScrollTopButton(view);
   });
 }
@@ -752,7 +1021,7 @@ function _updateArrowState(location) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §15. [R2c] destroyCurrentRenditionContext — 자원 해제 파이프라인
+   §17. 자원 해제 파이프라인
    ══════════════════════════════════════════════════════════ */
 async function destroyCurrentRenditionContext() {
   ReadingStatsTracker.stopSession();
@@ -760,7 +1029,7 @@ async function destroyCurrentRenditionContext() {
   SearchEngine.destroy();
   AnnotationManager.reset();
   VirtualSearchList.destroy();
-  ResourceRegistry.releaseAll(); /* [R2c] 모든 이벤트 리스너 일괄 해제 */
+  ResourceRegistry.releaseAll();
 
   const vp = DOMProxy.get('viewer-viewport');
   if (DOMProxy.exists('viewer-viewport')) {
@@ -777,19 +1046,19 @@ async function destroyCurrentRenditionContext() {
   });
   DOMProxy.invalidate();
 
-  setTextSafe(DOMProxy.get('nav-book-title'),        '도서 로딩 중...');
-  setTextSafe(DOMProxy.get('viewer-progress-text'),  '0%');
+  setTextSafe(DOMProxy.get('nav-book-title'),         '도서 로딩 중...');
+  setTextSafe(DOMProxy.get('viewer-progress-text'),   '0%');
   setTextSafe(DOMProxy.get('reading-location-range'), '- / -');
   DOMProxy.get('progress-bar-fill').style.width = '0%';
   if (DOMProxy.exists('toc-list')) DOMProxy.get('toc-list').innerHTML = '';
 }
 
 function exitViewer() {
-  destroyCurrentRenditionContext().then(() => { showUploaderScreen(); renderLibraryGrid(); });
+  destroyCurrentRenditionContext().then(() => { showUploaderScreen(); refreshLibraryData(); });
 }
 
 /* ══════════════════════════════════════════════════════════
-   §16. [UX#3] 가로↔세로 CFI 보정 스케줄러
+   §18. CFI 보정 스케줄러 (가로↔세로)
    ══════════════════════════════════════════════════════════ */
 function switchFlowMode(mode) {
   if (store.flow === mode || !store.book) return;
@@ -804,7 +1073,7 @@ function switchFlowMode(mode) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §17. NavGuard (뮤텍스 + 리사이즈 + 터치 스와이프)
+   §19. NavGuard
    ══════════════════════════════════════════════════════════ */
 const NavGuard = (() => {
   let navigating = false, pending = null, resizeObs = null, resizeTimer = null;
@@ -889,12 +1158,11 @@ const NavGuard = (() => {
 
   function init(rendition) { navigating = false; pending = null; gestureAxis = null; _initResize(rendition); _initTouch(); }
   function destroy() { if (resizeObs) { resizeObs.disconnect(); resizeObs = null; } clearTimeout(resizeTimer); navigating = false; pending = null; }
-
   return { init, destroy, prev, next, onRelocated };
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §18. locations 백그라운드 생성
+   §20. locations 백그라운드 생성
    ══════════════════════════════════════════════════════════ */
 function generateLocationsBackground(book) {
   if (typeof Worker !== 'undefined') {
@@ -909,7 +1177,7 @@ function generateLocationsBackground(book) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §19. TOC 사이드바
+   §21. TOC 사이드바
    ══════════════════════════════════════════════════════════ */
 function renderTocSidebar(tocData) {
   const container = DOMProxy.get('toc-list');
@@ -947,7 +1215,7 @@ function updateTocActiveItem(href) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §20. [UX#22] 가상 스크롤 검색 레이어 (IntersectionObserver 재활용 풀)
+   §22. Virtual Search List (IntersectionObserver 재활용 풀)
    ══════════════════════════════════════════════════════════ */
 const VirtualSearchList = (() => {
   const VISIBLE = 20, ITEM_H = 64;
@@ -1012,7 +1280,7 @@ const VirtualSearchList = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §21. 전문 검색 엔진
+   §23. 전문 검색 엔진
    ══════════════════════════════════════════════════════════ */
 const SearchEngine = (() => {
   let index = new Map(), isBuilt = false;
@@ -1069,42 +1337,494 @@ function injectSearchHighlight(cfi) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §22. 서재 그리드 ([UX#2] 스켈레톤 UI)
+   §24. [L1/L2/v5] 서재 렌더링 — 최근 읽은 책 · 폴더 · 도서 카드
    ══════════════════════════════════════════════════════════ */
-function renderLibraryGrid() {
-  const grid = DOMProxy.get('library-grid');
-  if (!DOMProxy.exists('library-grid')) return;
-  grid.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>';
+const TITLE_MAX_LEN = 10; /* [L2] 말줄임표 최대 글자 수 */
 
-  StorageSystem.getAllBooks().then(books => {
-    grid.innerHTML = '';
-    if (!books.length) {
-      const p = document.createElement('p');
-      p.style.cssText = 'grid-column:1/-1;font-size:12px;color:var(--color-ink-muted);text-align:center;padding:16px;';
-      p.textContent = '저장된 도서가 없습니다. EPUB 파일을 업로드해 주세요.'; grid.appendChild(p); return;
-    }
-    const frag = document.createDocumentFragment();
-    books.forEach(b => {
-      const card = document.createElement('div'); card.className = 'book-card'; card.setAttribute('role','listitem');
-      const cover = document.createElement('div'); cover.className = 'book-cover-placeholder'; cover.textContent = 'EPUB'; cover.setAttribute('aria-hidden','true');
-      const titleEl = document.createElement('div'); titleEl.className = 'book-card-title'; titleEl.textContent = b.title || '제목 없음';
-      const delBtn = document.createElement('button'); delBtn.className = 'btn-delete-book'; delBtn.textContent = '✕';
-      delBtn.title = '서재에서 제거'; delBtn.setAttribute('aria-label', (b.title||'도서') + ' 서재에서 제거');
-      delBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (confirm('이 도서를 서재에서 제거하시겠습니까?')) StorageSystem.deleteBook(b.bookKey).then(() => renderLibraryGrid());
-      });
-      card.appendChild(cover); card.appendChild(titleEl); card.appendChild(delBtn);
-      card.setAttribute('aria-label', (b.title||'제목 없음') + ' 열기');
-      card.addEventListener('click', () => openEpubBook(b.bytes, true));
-      frag.appendChild(card);
+function truncateTitle(title) {
+  if (!title) return '제목 없음';
+  return title.length > TITLE_MAX_LEN ? title.slice(0, TITLE_MAX_LEN) + '…' : title;
+}
+
+/** 제목 문자열로 HSL 색조값 생성 (0~360) */
+function _titleToHue(title) {
+  let hash = 0;
+  for (let i = 0; i < title.length; i++) { hash = title.charCodeAt(i) + ((hash << 5) - hash); }
+  return Math.abs(hash) % 360;
+}
+
+/** [보완] 이름+크기 기반 파일 해시 (중복 등록 방지) */
+function computeFileHash(file) {
+  const seed = `${file.name}::${file.size}`;
+  let hash = 5381;
+  for (let i = 0; i < seed.length; i++) hash = ((hash << 5) + hash) + seed.charCodeAt(i);
+  return `h${(hash >>> 0).toString(36)}_${file.size}`;
+}
+
+/**
+ * [v5] 서재 데이터 로드 → Reactive Store 반영
+ * store.libraryBooks / store.folders 변경 시 바인더가 그리드를 다시 그림
+ */
+async function refreshLibraryData() {
+  const [books, folders] = await Promise.all([
+    StorageSystem.getAllBooks(),
+    StorageSystem.getAllFolders(),
+  ]);
+  ReactiveStore.patch({ libraryBooks: books, folders });
+}
+
+/** [L1] 표지 또는 HSL 플레이스홀더 노드 생성 */
+function _buildCoverNode(book) {
+  if (book.coverDataUrl) {
+    const img = document.createElement('img');
+    img.className = 'book-cover-img';
+    img.src       = book.coverDataUrl;
+    img.alt       = book.title || '표지';
+    img.loading   = 'lazy';
+    /* [보완] 표지 로드 실패 시 HSL 플레이스홀더로 폴백 */
+    img.onerror = () => { img.replaceWith(_buildPlaceholder(book.title || '')); };
+    return img;
+  }
+  return _buildPlaceholder(book.title || '');
+}
+
+/** [보완] 제목 첫 글자 기반 HSL 플레이스홀더 */
+function _buildPlaceholder(title) {
+  const placeholder = document.createElement('div');
+  placeholder.className = 'book-cover-placeholder';
+  const hue = _titleToHue(title);
+  placeholder.style.background = `hsl(${hue}, 32%, 70%)`;
+  placeholder.setAttribute('aria-hidden', 'true');
+  const initials = document.createElement('span');
+  initials.textContent = (title.trim()[0] || 'E').toUpperCase();
+  placeholder.appendChild(initials);
+  return placeholder;
+}
+
+/**
+ * [요구2-최상단] 최근 읽은 책 3권 렌더링 (진행률 포함)
+ */
+function renderRecentBooks(books) {
+  const section = DOMProxy.get('recent-section');
+  const row     = DOMProxy.get('recent-row');
+  if (!DOMProxy.exists('recent-row')) return;
+
+  const recent = books
+    .filter(b => b.lastReadAt)
+    .sort((a, b) => (b.lastReadAt || 0) - (a.lastReadAt || 0))
+    .slice(0, RECENT_MAX);
+
+  if (!recent.length) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  row.innerHTML = '';
+
+  const frag = document.createDocumentFragment();
+  recent.forEach(b => {
+    const pct = b.percent || 0;
+    const item = document.createElement('div');
+    item.className = 'recent-card';
+    item.setAttribute('role', 'listitem');
+    item.setAttribute('aria-label', `${b.title || '제목 없음'} 이어 읽기 (${pct}%)`);
+
+    const cover = document.createElement('div');
+    cover.className = 'recent-cover';
+    cover.appendChild(_buildCoverNode(b));
+
+    const info = document.createElement('div');
+    info.className = 'recent-info';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'recent-title';
+    titleEl.textContent = b.title || '제목 없음';
+
+    const progWrap = document.createElement('div');
+    progWrap.className = 'recent-progress-track';
+    progWrap.setAttribute('role', 'progressbar');
+    progWrap.setAttribute('aria-valuenow', String(pct));
+    progWrap.setAttribute('aria-valuemin', '0');
+    progWrap.setAttribute('aria-valuemax', '100');
+    const progFill = document.createElement('div');
+    progFill.className = 'recent-progress-fill';
+    progFill.style.width = `${pct}%`;
+    progWrap.appendChild(progFill);
+
+    const pctText = document.createElement('span');
+    pctText.className = 'recent-pct';
+    pctText.textContent = `${pct}% 읽음`;
+
+    info.appendChild(titleEl);
+    info.appendChild(progWrap);
+    info.appendChild(pctText);
+
+    item.appendChild(cover);
+    item.appendChild(info);
+    item.addEventListener('click', () => openEpubBook(b.bytes, true));
+    frag.appendChild(item);
+  });
+  row.appendChild(frag);
+}
+
+/**
+ * [요구2-중단] 폴더 칩 바 렌더링
+ */
+function renderFolderBar(folders, books) {
+  const bar = DOMProxy.get('folder-bar');
+  if (!DOMProxy.exists('folder-bar')) return;
+  bar.innerHTML = '';
+
+  const frag = document.createDocumentFragment();
+
+  /* '전체' 칩 */
+  const allChip = document.createElement('button');
+  allChip.className = 'folder-chip' + (store.activeFolderId === null ? ' active' : '');
+  allChip.textContent = `전체 (${books.length})`;
+  allChip.setAttribute('role', 'tab');
+  allChip.setAttribute('aria-selected', String(store.activeFolderId === null));
+  allChip.addEventListener('click', () => { store.activeFolderId = null; });
+  frag.appendChild(allChip);
+
+  /* 폴더 칩들 */
+  folders.forEach(f => {
+    const cnt = books.filter(b => b.folderId === f.id).length;
+    const chip = document.createElement('button');
+    chip.className = 'folder-chip' + (store.activeFolderId === f.id ? ' active' : '');
+    chip.setAttribute('role', 'tab');
+    chip.setAttribute('aria-selected', String(store.activeFolderId === f.id));
+
+    const label = document.createElement('span');
+    label.textContent = `📁 ${f.name} (${cnt})`;
+    chip.appendChild(label);
+
+    /* 폴더 삭제 버튼 */
+    const del = document.createElement('span');
+    del.className = 'folder-chip-del';
+    del.textContent = '✕';
+    del.setAttribute('role', 'button');
+    del.setAttribute('aria-label', `${f.name} 폴더 삭제`);
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (confirm(`'${f.name}' 폴더를 삭제하시겠습니까?\n(폴더 안의 도서는 서재에 그대로 남습니다)`)) {
+        StorageSystem.deleteFolder(f.id).then(async () => {
+          if (store.activeFolderId === f.id) store.activeFolderId = null;
+          await refreshLibraryData();
+          Toast.show('폴더가 삭제되었습니다.', 'success');
+        });
+      }
     });
-    grid.appendChild(frag);
+    chip.appendChild(del);
+
+    chip.addEventListener('click', () => { store.activeFolderId = f.id; });
+    frag.appendChild(chip);
+  });
+
+  /* 폴더 생성 버튼 */
+  const addChip = document.createElement('button');
+  addChip.className = 'folder-chip folder-chip--add';
+  addChip.textContent = '+ 폴더';
+  addChip.setAttribute('aria-label', '새 폴더 생성');
+  addChip.addEventListener('click', createFolderPrompt);
+  frag.appendChild(addChip);
+
+  bar.appendChild(frag);
+}
+
+/** 폴더 생성 프롬프트 */
+function createFolderPrompt() {
+  const name = prompt('새 폴더 이름을 입력하세요:');
+  if (!name || !name.trim()) return;
+  const folder = { id: 'folder_' + Date.now().toString(36), name: name.trim().slice(0, 30), ts: Date.now() };
+  StorageSystem.saveFolder(folder).then(async () => {
+    await refreshLibraryData();
+    Toast.show(`'${folder.name}' 폴더가 생성되었습니다.`, 'success');
   });
 }
 
+/**
+ * [요구2-도서카드] 카드 메뉴 (폴더 지정 + 삭제)
+ */
+function _showCardMenu(book, anchorEl) {
+  document.querySelectorAll('.card-menu-popup').forEach(m => m.remove());
+
+  const menu = document.createElement('div');
+  menu.className = 'card-menu-popup';
+  menu.setAttribute('role', 'menu');
+
+  const head = document.createElement('div');
+  head.className = 'card-menu-head';
+  head.textContent = '폴더로 이동';
+  menu.appendChild(head);
+
+  /* 폴더 없음(전체) 옵션 */
+  const noneItem = document.createElement('button');
+  noneItem.className = 'card-menu-item' + (book.folderId == null ? ' checked' : '');
+  noneItem.setAttribute('role', 'menuitem');
+  noneItem.textContent = '📚 폴더 없음';
+  noneItem.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await StorageSystem.setBookFolder(book.bookKey, null);
+    await refreshLibraryData();
+    menu.remove();
+  });
+  menu.appendChild(noneItem);
+
+  store.folders.forEach(f => {
+    const item = document.createElement('button');
+    item.className = 'card-menu-item' + (book.folderId === f.id ? ' checked' : '');
+    item.setAttribute('role', 'menuitem');
+    item.textContent = `📁 ${f.name}`;
+    item.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await StorageSystem.setBookFolder(book.bookKey, f.id);
+      await refreshLibraryData();
+      menu.remove();
+      Toast.show(`'${f.name}'(으)로 이동했습니다.`, 'success');
+    });
+    menu.appendChild(item);
+  });
+
+  /* 새 폴더 생성 후 이동 */
+  const newFolder = document.createElement('button');
+  newFolder.className = 'card-menu-item card-menu-item--accent';
+  newFolder.setAttribute('role', 'menuitem');
+  newFolder.textContent = '+ 새 폴더에 추가';
+  newFolder.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const name = prompt('새 폴더 이름:');
+    if (name && name.trim()) {
+      const folder = { id: 'folder_' + Date.now().toString(36), name: name.trim().slice(0, 30), ts: Date.now() };
+      await StorageSystem.saveFolder(folder);
+      await StorageSystem.setBookFolder(book.bookKey, folder.id);
+      await refreshLibraryData();
+      Toast.show(`'${folder.name}'에 추가되었습니다.`, 'success');
+    }
+    menu.remove();
+  });
+  menu.appendChild(newFolder);
+
+  const divider = document.createElement('div');
+  divider.className = 'card-menu-divider';
+  menu.appendChild(divider);
+
+  /* 삭제 */
+  const delItem = document.createElement('button');
+  delItem.className = 'card-menu-item card-menu-item--danger';
+  delItem.setAttribute('role', 'menuitem');
+  delItem.textContent = '🗑 서재에서 삭제';
+  delItem.addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.remove();
+    if (confirm('이 도서를 서재에서 제거하시겠습니까?')) {
+      StorageSystem.deleteBook(book.bookKey).then(async () => {
+        await refreshLibraryData();
+        Toast.show('도서가 삭제되었습니다.', 'success');
+      });
+    }
+  });
+  menu.appendChild(delItem);
+
+  document.body.appendChild(menu);
+
+  /* 위치 — 앵커 기준, 뷰포트 오버플로우 방지 */
+  const rect = anchorEl.getBoundingClientRect();
+  let left = rect.left;
+  let top  = rect.bottom + 6;
+  const mw = 200, mh = menu.offsetHeight || 280;
+  if (left + mw > window.innerWidth - 8)  left = window.innerWidth - mw - 8;
+  if (top + mh > window.innerHeight - 8)  top = rect.top - mh - 6;
+  menu.style.left = `${Math.max(8, left)}px`;
+  menu.style.top  = `${Math.max(8, top)}px`;
+
+  /* 외부 클릭 닫기 */
+  const closeHandler = (e) => {
+    if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('pointerdown', closeHandler); }
+  };
+  setTimeout(() => document.addEventListener('pointerdown', closeHandler), 10);
+}
+
+/**
+ * [요구2-하단] 도서 그리드 렌더링 (현재 폴더 필터 적용)
+ */
+function renderLibraryGrid() {
+  const grid  = DOMProxy.get('library-grid');
+  const empty = DOMProxy.get('library-empty');
+  const count = DOMProxy.get('library-count');
+  if (!DOMProxy.exists('library-grid')) return;
+
+  const allBooks = store.libraryBooks || [];
+
+  /* 최상단 최근 읽은 책 + 폴더 바 동시 갱신 */
+  renderRecentBooks(allBooks);
+  renderFolderBar(store.folders || [], allBooks);
+
+  /* 현재 폴더 필터 */
+  const books = store.activeFolderId === null
+    ? allBooks
+    : allBooks.filter(b => b.folderId === store.activeFolderId);
+
+  grid.innerHTML = '';
+
+  if (!allBooks.length) {
+    if (empty) empty.style.display = 'flex';
+    if (count) count.textContent = '';
+    return;
+  }
+
+  if (empty) empty.style.display = 'none';
+  if (count) count.textContent = `${books.length}권`;
+
+  if (!books.length) {
+    const p = document.createElement('p');
+    p.style.cssText = 'grid-column:1/-1;text-align:center;padding:30px;color:var(--color-ink-muted);font-size:13px;';
+    p.textContent = '이 폴더에 도서가 없습니다.';
+    grid.appendChild(p);
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  books.forEach(b => {
+    const fullTitle = b.title || '제목 없음';
+    const pct = b.percent || 0;
+
+    const card = document.createElement('div');
+    card.className = 'book-card';
+    card.setAttribute('role', 'listitem');
+    card.setAttribute('aria-label', `${fullTitle} 열기 (${pct}% 읽음)`);
+
+    /* [L1] 표지 영역 */
+    const coverWrap = document.createElement('div');
+    coverWrap.className = 'book-cover-wrap';
+    coverWrap.dataset.tooltip = fullTitle; /* [L2] 툴팁 */
+    coverWrap.appendChild(_buildCoverNode(b));
+
+    /* 진행률 배지 */
+    if (pct > 0) {
+      const badge = document.createElement('div');
+      badge.className = 'book-progress-badge';
+      badge.textContent = `${pct}%`;
+      coverWrap.appendChild(badge);
+    }
+
+    /* 카드 메뉴 버튼 (⋯) — 폴더 지정 + 삭제 */
+    const menuBtn = document.createElement('button');
+    menuBtn.className = 'btn-card-menu';
+    menuBtn.textContent = '⋯';
+    menuBtn.title = '도서 메뉴';
+    menuBtn.setAttribute('aria-label', `${fullTitle} 메뉴 (폴더 지정·삭제)`);
+    menuBtn.setAttribute('aria-haspopup', 'menu');
+    menuBtn.addEventListener('click', (e) => { e.stopPropagation(); _showCardMenu(b, menuBtn); });
+    coverWrap.appendChild(menuBtn);
+
+    /* 하단 진행률 라인 */
+    const progLine = document.createElement('div');
+    progLine.className = 'book-card-progress';
+    const progLineFill = document.createElement('div');
+    progLineFill.className = 'book-card-progress-fill';
+    progLineFill.style.width = `${pct}%`;
+    progLine.appendChild(progLineFill);
+    coverWrap.appendChild(progLine);
+
+    /* [L2] 제목: 최대 10자 말줄임표 */
+    const titleEl = document.createElement('div');
+    titleEl.className = 'book-card-title';
+    titleEl.textContent = truncateTitle(fullTitle);
+
+    card.appendChild(coverWrap);
+    card.appendChild(titleEl);
+    card.addEventListener('click', () => openEpubBook(b.bytes, true));
+
+    frag.appendChild(card);
+  });
+  grid.appendChild(frag);
+}
+
 /* ══════════════════════════════════════════════════════════
-   §23. [UX#11] TTS 엔진
+   §25. [L3] 다중 파일 순차 등록 파이프라인 + [보완] 중복 방지
+   ══════════════════════════════════════════════════════════ */
+async function importEpubFiles(files) {
+  if (!files || files.length === 0) return;
+
+  /* [B1] ePub 가드 먼저 */
+  const epubReady = await waitForEpubJS();
+  if (!epubReady) {
+    Toast.show('epub.js 라이브러리를 로드하지 못했습니다. 페이지를 새로고침해 주세요.', 'error');
+    return;
+  }
+
+  const fileArr = Array.from(files);
+  const total   = fileArr.length;
+
+  if (total === 1) {
+    /* [보완] 단일 파일도 중복 체크 */
+    const hash = computeFileHash(fileArr[0]);
+    const dup  = await StorageSystem.findBookByHash(hash);
+    if (dup) {
+      Toast.show(`이미 서재에 있는 도서입니다: ${truncateTitle(dup.title)}`, 'info');
+      await openEpubBook(dup.bytes, true);
+      return;
+    }
+    await openEpubBook(fileArr[0], false);
+    return;
+  }
+
+  /* 다중 파일: 서재에만 순차 등록 후 그리드 갱신 */
+  ImportProgress.show(`0 / ${total} 도서 추가 중...`);
+  let successCount = 0, dupCount = 0;
+
+  for (let i = 0; i < fileArr.length; i++) {
+    const file = fileArr[i];
+
+    if (!file.name.toLowerCase().endsWith('.epub')) {
+      Toast.show(`${file.name}: EPUB 파일이 아닙니다.`, 'error');
+      continue;
+    }
+
+    /* [보완] 중복 파일 등록 방지 (이름+크기 해시) */
+    const fileHash = computeFileHash(file);
+    const existing = await StorageSystem.findBookByHash(fileHash);
+    if (existing) { dupCount++; continue; }
+
+    ImportProgress.update(
+      Math.round(((i + 0.5) / total) * 100),
+      `${i + 1} / ${total} — ${file.name.slice(0, 20)}`
+    );
+
+    await ErrorBoundary.wrap('renderer', async () => {
+      const buf  = await file.arrayBuffer();
+      const book = window.ePub(buf.slice(0));
+      await book.ready;
+
+      let title = file.name.replace(/\.epub$/i, ''), creator = '';
+      try {
+        const meta = await book.loaded.metadata;
+        title   = meta.title   || title;
+        creator = meta.creator || '';
+      } catch (_) {}
+
+      const coverDataUrl = await extractCoverDataUrl(book);
+      try { book.destroy(); } catch (_) {}
+
+      const bookKey = 'fable_cfi_' + (title + creator).replace(/[^a-zA-Z0-9가-힣]/g, '_').slice(0, 50);
+      await StorageSystem.saveBook(bookKey, buf, title, creator, coverDataUrl, fileHash);
+      successCount++;
+    })();
+
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  ImportProgress.update(100, '완료!');
+  await new Promise(r => setTimeout(r, 600));
+  ImportProgress.hide();
+
+  await refreshLibraryData();
+
+  let msg = '';
+  if (successCount > 0) msg += `${successCount}권 추가`;
+  if (dupCount > 0)     msg += `${msg ? ', ' : ''}중복 ${dupCount}권 제외`;
+  if (msg) Toast.show(msg + ' 완료', 'success');
+}
+
+/* ══════════════════════════════════════════════════════════
+   §26. TTS 엔진
    ══════════════════════════════════════════════════════════ */
 const TTSSystem = (() => {
   let utterance = null, isPaused = false, totalLen = 0;
@@ -1126,7 +1846,7 @@ const TTSSystem = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §24. [UX#15] 독서 통계 + 탄력 모션
+   §27. 독서 통계
    ══════════════════════════════════════════════════════════ */
 const ReadingStatsTracker = (() => {
   let timer = null;
@@ -1154,7 +1874,7 @@ const ReadingStatsTracker = (() => {
 })();
 
 /* ══════════════════════════════════════════════════════════
-   §25. [UX#14] 롱프레스 컨텍스트 메뉴
+   §28. 컨텍스트 메뉴 (롱프레스)
    ══════════════════════════════════════════════════════════ */
 function initContextMenu() {
   const viewer = DOMProxy.get('screen-viewer');
@@ -1179,12 +1899,14 @@ function initContextMenu() {
 
   DOMProxy.get('ctx-copy').addEventListener('click', () => { if (selectedText) navigator.clipboard?.writeText(selectedText).catch(() => {}); Toast.show('클립보드에 복사했습니다.'); hideMenu(); });
   DOMProxy.get('ctx-tts').addEventListener('click', () => { if (selectedText) TTSSystem.play(selectedText); hideMenu(); });
-  DOMProxy.get('ctx-search').addEventListener('click', () => { const m=DOMProxy.get('search-modal'), i=DOMProxy.get('input-search-query'); i.value=selectedText; m.style.display='flex'; runSearchExecution(); hideMenu(); });
+  DOMProxy.get('ctx-search').addEventListener('click', () => {
+    const m=DOMProxy.get('search-modal'), i=DOMProxy.get('input-search-query'); i.value=selectedText; m.style.display='flex'; runSearchExecution(); hideMenu();
+  });
   DOMProxy.get('ctx-highlight').addEventListener('click', () => { Toast.show('하이라이트 기능은 텍스트 선택 후 자동 추가됩니다.'); hideMenu(); });
 }
 
 /* ══════════════════════════════════════════════════════════
-   §26. [UX#21] 어노테이션 매니저
+   §29. Annotation Manager
    ══════════════════════════════════════════════════════════ */
 const AnnotationManager = (() => {
   let _rendition = null;
@@ -1211,7 +1933,7 @@ const AnnotationManager = (() => {
 function initAnnotationManager(rendition) { AnnotationManager.init(rendition); }
 
 /* ══════════════════════════════════════════════════════════
-   §27. [UX#12] 폰트 업로드 샌드박스
+   §30. 폰트 업로더
    ══════════════════════════════════════════════════════════ */
 function initFontUploader() {
   if (!DOMProxy.exists('font-uploader')) return;
@@ -1231,7 +1953,7 @@ function initFontUploader() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §28. [UX#23] 커스텀 테마 빌더
+   §31. 커스텀 테마 빌더
    ══════════════════════════════════════════════════════════ */
 function initCustomThemeBuilder() {
   function syncColor(colorId, hexId, storeKey) {
@@ -1246,7 +1968,7 @@ function initCustomThemeBuilder() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §29. 키보드 단축키 & 단축키 팁
+   §32. 키보드 단축키
    ══════════════════════════════════════════════════════════ */
 function handleKeyDown(e) {
   const viewer = DOMProxy.get('screen-viewer');
@@ -1270,7 +1992,7 @@ function showKeyboardHint() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §30. 오프라인 배너 + 동기화 트리거
+   §33. 오프라인 배너
    ══════════════════════════════════════════════════════════ */
 function initOfflineBanner() {
   function update(offline) {
@@ -1282,7 +2004,7 @@ function initOfflineBanner() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §31. 스크롤 맨위로 버튼
+   §34. 스크롤 맨위로 버튼
    ══════════════════════════════════════════════════════════ */
 function bindScrollTopButton(view) {
   const btn = DOMProxy.get('btn-scroll-top');
@@ -1295,7 +2017,7 @@ function bindScrollTopButton(view) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §32. 설정 저장 / 복원
+   §35. 설정 저장 / 복원
    ══════════════════════════════════════════════════════════ */
 function _saveStateToLS() {
   const snap = { fontSize: store.fontSize, lineHeight: store.lineHeight, theme: store.theme, flow: store.flow,
@@ -1315,28 +2037,85 @@ function _loadStateFromLS() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §33. 버튼 이벤트 전체 바인딩
+   §36. 버튼 이벤트 전체 바인딩
    ══════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════
+   §35b. [요구3] 퍼센트 위치 이동
+   ══════════════════════════════════════════════════════════ */
+function _seekToPercent(pct) {
+  if (!store.rendition || !store.book) return;
+  pct = Math.min(100, Math.max(0, pct));
+  try {
+    /* locations가 생성돼 있으면 CFI로 정밀 이동 */
+    if (store.book.locations && store.totalLocations > 0) {
+      const cfi = store.book.locations.cfiFromPercentage(pct / 100);
+      if (cfi) { store.rendition.display(cfi).catch(() => {}); return; }
+    }
+    /* 폴백: spine 인덱스 기준 이동 */
+    const spineLen = store.book.spine?.items?.length || 1;
+    const idx = Math.min(spineLen - 1, Math.floor((pct / 100) * spineLen));
+    const item = store.book.spine?.items?.[idx];
+    if (item) store.rendition.display(item.href).catch(() => {});
+  } catch (e) { ErrorBoundary.handle('renderer', e, 'seekToPercent'); }
+}
+
 function initButtonEventHandlers() {
-  const dropzone = DOMProxy.get('dropzone'), fileInput = DOMProxy.get('file-input');
+  const fileInput = DOMProxy.get('file-input');
 
-  DOMProxy.get('btn-file-select').addEventListener('click', (e) => { e.stopPropagation(); fileInput.click(); });
-  fileInput.addEventListener('change', async (e) => { const f = e.target.files[0]; if (f) await openEpubBook(f, false); fileInput.value = ''; });
+  /* ── [U1] 서재 화면 상단 컨트롤 바 ── */
+  DOMProxy.get('btn-file-select').addEventListener('click', (e) => {
+    e.stopPropagation(); fileInput.click();
+  });
 
-  if (DOMProxy.exists('dropzone')) {
-    dropzone.addEventListener('click', () => fileInput.click());
-    dropzone.addEventListener('dragenter', (e) => { e.preventDefault(); dropzone.classList.add('drag-over'); });
-    dropzone.addEventListener('dragover',  (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; dropzone.classList.add('drag-over'); });
-    dropzone.addEventListener('dragleave', (e) => { if (!dropzone.contains(e.relatedTarget)) dropzone.classList.remove('drag-over'); });
-    dropzone.addEventListener('drop', async (e) => {
-      e.preventDefault(); dropzone.classList.remove('drag-over');
-      dropzone.classList.add('drop-bounce'); setTimeout(() => dropzone.classList.remove('drop-bounce'), 600);
-      const files = e.dataTransfer.files; if (!files?.length) return;
-      if (files.length > 1) { Toast.show('파일은 하나씩만 열 수 있습니다.', 'error'); return; }
-      await openEpubBook(files[0], false);
-    });
-  }
+  /* [L3] 다중 파일 change */
+  fileInput.addEventListener('change', async (e) => {
+    if (e.target.files && e.target.files.length > 0) {
+      await importEpubFiles(e.target.files);
+    }
+    fileInput.value = '';
+  });
 
+  /* [U2] 서재 화면 설정 버튼 */
+  DOMProxy.get('btn-library-settings').addEventListener('click', () => {
+    store.isSettingsOpen = !store.isSettingsOpen;
+  });
+
+  /* ── 드래그앤드롭 (서재 화면 전체) ── */
+  const uploader = DOMProxy.get('screen-uploader');
+  const dragOverlay = DOMProxy.get('drag-overlay');
+
+  let dragCounter = 0;
+
+  document.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    dragCounter++;
+    /* 서재 화면일 때만 오버레이 표시 */
+    if (!store.isViewerOpen) {
+      dragOverlay.style.display = 'flex';
+    }
+  });
+
+  document.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      dragOverlay.style.display = 'none';
+    }
+  });
+
+  document.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+
+  document.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    dragCounter = 0;
+    dragOverlay.style.display = 'none';
+    const files = e.dataTransfer.files;
+    if (!files?.length) return;
+    await importEpubFiles(files);
+  });
+
+  /* ── 뷰어 ── */
   DOMProxy.get('arrow-prev').addEventListener('click', () => NavGuard.prev());
   DOMProxy.get('arrow-next').addEventListener('click', () => NavGuard.next());
 
@@ -1344,9 +2123,15 @@ function initButtonEventHandlers() {
   DOMProxy.get('btn-toc-close').addEventListener('click',  () => { store.isTocOpen = false; });
   DOMProxy.get('toc-overlay').addEventListener('click',    () => { store.isTocOpen = false; });
 
+  /* [U2] 뷰어 설정 버튼 */
   DOMProxy.get('btn-settings-toggle').addEventListener('click', () => { store.isSettingsOpen = !store.isSettingsOpen; });
-  DOMProxy.get('btn-settings-close').addEventListener('click',  () => { store.isSettingsOpen = false; });
-  DOMProxy.get('btn-close-viewer').addEventListener('click', () => { if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer(); });
+
+  /* 공용 설정 닫기 버튼 */
+  DOMProxy.get('btn-settings-close').addEventListener('click', () => { store.isSettingsOpen = false; });
+
+  DOMProxy.get('btn-close-viewer').addEventListener('click', () => {
+    if (confirm('뷰어를 닫고 서재로 돌아가시겠습니까?')) exitViewer();
+  });
 
   DOMProxy.qa('[data-flow]').forEach(btn => btn.addEventListener('click', () => switchFlowMode(btn.dataset.flow)));
   DOMProxy.get('btn-font-decrease').addEventListener('click', () => { store.fontSize = Math.max(60, store.fontSize - 5); _saveStateToLS(); });
@@ -1372,9 +2157,34 @@ function initButtonEventHandlers() {
   DOMProxy.get('btn-tts-stop').addEventListener('click',       () => TTSSystem.stop());
   DOMProxy.get('btn-hint-close').addEventListener('click', () => { DOMProxy.get('keyboard-hint-layer').style.display='none'; });
 
+  /* [요구3] 퍼센트 이동 드래그 바 (range input) */
+  const slider = DOMProxy.get('progress-range-slider');
+  if (DOMProxy.exists('progress-range-slider')) {
+    /* 드래그 중: 라벨만 갱신, 실제 이동은 보류 */
+    slider.addEventListener('input', () => {
+      slider.dataset.dragging = '1';
+      setTextSafe(DOMProxy.get('viewer-progress-text'), `${slider.value}%`);
+      DOMProxy.get('progress-bar-fill').style.width = `${slider.value}%`;
+    });
+    /* 드래그 종료(change): 해당 퍼센트 위치로 이동 */
+    slider.addEventListener('change', () => {
+      const pct = parseInt(slider.value, 10);
+      delete slider.dataset.dragging;
+      _seekToPercent(pct);
+    });
+  }
+
+  /* 설정 패널 외부 클릭 닫기 (서재/뷰어 양쪽 처리) */
   document.addEventListener('pointerdown', (e) => {
-    const panel = DOMProxy.get('settings-panel'), btn = DOMProxy.get('btn-settings-toggle');
-    if (store.isSettingsOpen && !panel.contains?.(e.target) && !btn.contains?.(e.target)) store.isSettingsOpen = false;
+    const panel  = DOMProxy.get('settings-panel');
+    const btnV   = DOMProxy.get('btn-settings-toggle');
+    const btnL   = DOMProxy.get('btn-library-settings');
+    if (store.isSettingsOpen &&
+        !panel.contains?.(e.target) &&
+        !btnV.contains?.(e.target) &&
+        !btnL.contains?.(e.target)) {
+      store.isSettingsOpen = false;
+    }
   }, { passive: true });
 
   document.addEventListener('keydown', handleKeyDown);
@@ -1383,20 +2193,22 @@ function initButtonEventHandlers() {
 }
 
 /* ══════════════════════════════════════════════════════════
-   §34. 전역 진입점
+   §37. 전역 진입점
    ══════════════════════════════════════════════════════════ */
 async function initializeSystemCore() {
+  /* [B1] 최상단 ePub 가드 로그 */
+  if (typeof window.ePub !== 'function') {
+    console.warn('[Fable] ePub 아직 로드되지 않음 — 폴링 가드 활성화');
+  }
+
   window.addEventListener('unhandledrejection', (e) => {
     ErrorBoundary.handle('global', e.reason ?? new Error('Unhandled rejection'), 'unhandledrejection');
   });
+
   window.addEventListener('beforeunload', () => {
     if (store.bookKey && store.currentCFI) {
       try { localStorage.setItem('fable_cfi_' + store.bookKey, JSON.stringify({ data: store.currentCFI, ts: Date.now() })); } catch (_) {}
     }
-  });
-
-  ['dragenter','dragover','drop'].forEach(evt => {
-    document.addEventListener(evt, (e) => { if (!DOMProxy.get('dropzone').contains?.(e.target)) e.preventDefault(); });
   });
 
   if ('serviceWorker' in navigator) {
@@ -1415,16 +2227,16 @@ async function initializeSystemCore() {
 
   await StorageSystem.init()?.catch(err => ErrorBoundary.handle('storage', err, 'init'));
 
-  mountReactiveBinders();   /* [R1] */
+  mountReactiveBinders();
   _loadStateFromLS();
   _forceSyncSettingsUI();
   initButtonEventHandlers();
-  initOfflineBanner();     /* [UX#18] */
-  initContextMenu();       /* [UX#14] */
-  renderLibraryGrid();
-  if (!('ontouchstart' in window)) showKeyboardHint(); /* [UX#17] */
+  initOfflineBanner();
+  initContextMenu();
+  refreshLibraryData();
+  if (!('ontouchstart' in window)) showKeyboardHint();
 
-  console.log('\uD83D\uDCD6 Fable v3 — Reactive Architecture Initialized');
+  console.log('\uD83D\uDCD6 Fable v3.1 — Library Edition Initialized');
 }
 
 function _forceSyncSettingsUI() {
